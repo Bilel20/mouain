@@ -328,7 +328,8 @@ class SchoolDataFormatter:
 
             lines = []
             lines.append(".ـ" * 60)
-            lines.append(f"{" " * 30}📌 {formatted_date_header}")
+            spaces = " " * 30
+            lines.append(f"{spaces} 📌 {formatted_date_header}")
             lines.append("ـ." * 60)
 
             cursor.execute("""
