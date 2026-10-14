@@ -6,6 +6,7 @@
 """
 import sys
 import sqlite3
+import json
 from pathlib import Path
 from datetime import date
 import pandas as pd
@@ -65,12 +66,17 @@ class Database:
         self.init_db()
 
     def connect(self):
-        con = sqlite3.connect(self.path)
+        # إعادة استعمال العبارات وتقليل انتظار القفل عند فتح أكثر من نافذة.
+        con = sqlite3.connect(self.path, timeout=10, cached_statements=256)
         con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA busy_timeout=10000")
         return con
 
     def init_db(self):
         with self.connect() as c:
+            # WAL يحسن التوازي بين القراءة والكتابة دون تغيير بنية البيانات.
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA synchronous=NORMAL")
             c.executescript("""
             CREATE TABLE IF NOT EXISTS ann_scolaire (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,6 +183,20 @@ class Database:
             DELETE FROM majal WHERE id NOT IN (
                 SELECT MIN(id) FROM majal GROUP BY name
             );
+            """)
+
+            # فهارس تخدم الاستعلامات المتكررة في دفتر الدروس والبرامج الرسمية.
+            c.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_day_data_year_date ON day_data(ann_scolaire_id, date);
+            CREATE INDEX IF NOT EXISTS idx_hessa_day ON hessa(day_data_id);
+            CREATE INDEX IF NOT EXISTS idx_nachat_hessa ON nachat(hessa_id);
+            CREATE INDEX IF NOT EXISTS idx_nachat_title ON nachat(title);
+            CREATE INDEX IF NOT EXISTS idx_nachat_detail_parent_key ON nachat_detail(nachat_id, key_name);
+            CREATE INDEX IF NOT EXISTS idx_competence_majal_filter ON competence_majal(id_level, id_majal);
+            CREATE INDEX IF NOT EXISTS idx_competence_matiere_parent ON competence_matiere(id_competence_majal);
+            CREATE INDEX IF NOT EXISTS idx_moukawan_parent ON moukawan_kifaya(id_competence_matiere);
+            CREATE INDEX IF NOT EXISTS idx_objectif_parent ON objectif_specifique(id_moukawa_kifaya);
+            CREATE INDEX IF NOT EXISTS idx_content_parent ON content(id_objectif_specifique);
             """)
 
             row = c.execute("SELECT id FROM ann_scolaire ORDER BY id LIMIT 1").fetchone()
@@ -438,6 +458,7 @@ class AutoCompletionTextEdit(QTextEdit):
         self.key_combo = key_combo
         self.activity_title = activity_title
         self.is_completing = False
+        self._completion_cache = {}
         self.setAcceptRichText(False)
         self.textChanged.connect(self.on_text_changed)
 
@@ -460,7 +481,7 @@ class AutoCompletionTextEdit(QTextEdit):
             current_text = self.toPlainText()
             if len(current_text.strip()) < 2:
                 return
-            match = self.find_match_with_pandas(current_text)
+            match = self.find_completion_match(current_text)
             if match and match.startswith(current_text) and match != current_text:
                 self.is_completing = True
                 remainder = match[len(current_text):]
@@ -471,66 +492,67 @@ class AutoCompletionTextEdit(QTextEdit):
                 self.setTextCursor(cursor)
                 self.is_completing = False
 
-    def find_match_with_pandas(self, current_text):
-        if not current_text.strip():
+    def find_completion_match(self, current_text):
+        """إكمال النص من قاعدة البيانات مع تخزين النتائج مؤقتاً لتقليل الاستعلامات."""
+        current_stripped = current_text.strip()
+        if not current_stripped:
             return ""
-        key_name = self.key_combo.currentText()
-        try:
-            with self.db.connect() as con:
-                df = pd.read_sql_query("""
-                    SELECT d.value_text 
-                    FROM nachat_detail d
-                    JOIN nachat n ON d.nachat_id = n.id
-                    WHERE d.key_name = ? AND n.title = ? AND COALESCE(d.value_text, '') <> ''
-                """, con, params=(key_name, self.activity_title))
-            
-            if df.empty:
+
+        key_name = self.key_combo.currentText().strip()
+        cache_key = (key_name, self.activity_title)
+        values = self._completion_cache.get(cache_key)
+        if values is None:
+            try:
                 with self.db.connect() as con:
-                    df = pd.read_sql_query("""
-                        SELECT d.value_text 
-                        FROM nachat_detail d
-                        WHERE d.key_name = ? AND COALESCE(d.value_text, '') <> ''
-                    """, con, params=(key_name,))
-            
-            if df.empty:
+                    rows = con.execute(
+                        """SELECT d.value_text
+                           FROM nachat_detail d
+                           JOIN nachat n ON n.id = d.nachat_id
+                           WHERE d.key_name = ? AND n.title = ?
+                             AND COALESCE(d.value_text, '') <> ''""",
+                        (key_name, self.activity_title),
+                    ).fetchall()
+                    if not rows:
+                        rows = con.execute(
+                            """SELECT value_text FROM nachat_detail
+                               WHERE key_name = ? AND COALESCE(value_text, '') <> ''""",
+                            (key_name,),
+                        ).fetchall()
+                values = [str(row[0]) for row in rows if row[0] is not None]
+                self._completion_cache[cache_key] = values
+            except sqlite3.Error:
                 return ""
 
-            text_series = df['value_text'].astype(str)
-            current_stripped = current_text.strip()
+        if not values:
+            return ""
 
-            matches = text_series[text_series.str.startswith(current_stripped, na=False)]
-            if not matches.empty:
-                most_frequent = matches.value_counts().index[0]
-                return most_frequent
+        from collections import Counter
+        prefix_matches = [value for value in values if value.startswith(current_stripped)]
+        if prefix_matches:
+            return Counter(prefix_matches).most_common(1)[0][0]
 
-            tokens_list = []
-            bigrams = []
-            for text in text_series:
-                tokens = text.split()
-                tokens_list.extend(tokens)
-                for i in range(len(tokens) - 1):
-                    bigrams.append((tokens[i], tokens[i+1]))
+        tokens = []
+        bigrams = []
+        for value in values:
+            words = value.split()
+            tokens.extend(words)
+            bigrams.extend(zip(words, words[1:]))
 
-            current_tokens = current_stripped.split()
-            if current_tokens:
-                last_typed_word = current_tokens[-1]
-                matching_tokens = [t for t in tokens_list if t.startswith(last_typed_word) and t != last_typed_word]
-                if matching_tokens:
-                    best_token = pd.Series(matching_tokens).mode().iloc[0]
-                    if len(current_tokens) > 1:
-                        return " ".join(current_tokens[:-1]) + " " + best_token
-                    else:
-                        return best_token
+        current_tokens = current_stripped.split()
+        if not current_tokens:
+            return ""
 
-                if len(current_tokens) >= 1:
-                    prev_word = current_tokens[-1]
-                    next_words = [b[1] for b in bigrams if b[0] == prev_word]
-                    if next_words:
-                        best_next = pd.Series(next_words).mode().iloc[0]
-                        return current_stripped + " " + best_next
+        last_word = current_tokens[-1]
+        candidates = [word for word in tokens if word.startswith(last_word) and word != last_word]
+        if candidates:
+            best = Counter(candidates).most_common(1)[0][0]
+            if len(current_tokens) > 1:
+                return " ".join(current_tokens[:-1] + [best])
+            return best
 
-        except Exception as e:
-            print(f"Pandas Completion error: {e}")
+        next_words = [right for left, right in bigrams if left == last_word]
+        if next_words:
+            return current_stripped + " " + Counter(next_words).most_common(1)[0][0]
         return ""
 
 
@@ -1068,7 +1090,7 @@ class CompetenceManagerDialog(QDialog):
         # جدول كفايات المواد
         matiere_widget = QWidget()
         matiere_layout = QVBoxLayout(matiere_widget)
-        matiere_layout.addWidget(QLabel("<b>2. كفايات المواد المرتبطة بكفاية المجال المختارة (Competence Matiere)</b>"))
+        matiere_layout.addWidget(QLabel("<b>2. كفايات المواد المرتبطة بكفاية المجال المختارة</b>"))
         
         matiere_btns_layout = QHBoxLayout()
         for text, slot, act_type in [
@@ -1083,7 +1105,7 @@ class CompetenceManagerDialog(QDialog):
             matiere_btns_layout.addWidget(b)
         matiere_layout.addLayout(matiere_btns_layout)
 
-        self.tbl_competence_matiere = self.create_clean_table(["المادة (Matiere)", "كفاية المادة"])
+        self.tbl_competence_matiere = self.create_clean_table(["المادة", "كفاية المادة"])
         matiere_layout.addWidget(self.tbl_competence_matiere)
         splitter.addWidget(matiere_widget)
 
@@ -1136,28 +1158,35 @@ class CompetenceManagerDialog(QDialog):
         self.load_competence_majal_data()
 
     def load_competence_majal_data(self):
-        self.tbl_competence_majal.setRowCount(0)
-        self.tbl_competence_matiere.setRowCount(0)
-        
-        if not self.selected_level_id or not self.selected_majal_id:
-            return
-
+        self.tbl_competence_majal.setUpdatesEnabled(False)
+        self.tbl_competence_matiere.setUpdatesEnabled(False)
         try:
+            self.tbl_competence_majal.setRowCount(0)
+            self.tbl_competence_matiere.setRowCount(0)
+            if not self.selected_level_id or not self.selected_majal_id:
+                return
+
             with self.db.connect() as con:
-                for row in con.execute("""
-                    SELECT id, competence FROM competence_majal 
-                    WHERE id_majal = ? AND id_level = ?
-                """, (self.selected_majal_id, self.selected_level_id)).fetchall():
-                    r = self.tbl_competence_majal.rowCount()
-                    self.tbl_competence_majal.insertRow(r)
-                    item = QTableWidgetItem(row[1])
-                    item.setData(Qt.UserRole, row[0])
-                    self.tbl_competence_majal.setItem(r, 0, item)
-                
-                if self.tbl_competence_majal.rowCount() > 0:
-                    self.tbl_competence_majal.selectRow(0)
-        except Exception as e:
-            print(f"Error loading competence_majal: {e}")
+                rows = con.execute(
+                    """SELECT id, competence FROM competence_majal
+                       WHERE id_majal = ? AND id_level = ? ORDER BY id""",
+                    (self.selected_majal_id, self.selected_level_id),
+                ).fetchall()
+
+            for rec_id, competence in rows:
+                row_index = self.tbl_competence_majal.rowCount()
+                self.tbl_competence_majal.insertRow(row_index)
+                item = QTableWidgetItem(competence)
+                item.setData(Qt.UserRole, rec_id)
+                self.tbl_competence_majal.setItem(row_index, 0, item)
+
+            if self.tbl_competence_majal.rowCount() > 0:
+                self.tbl_competence_majal.selectRow(0)
+        except Exception as exc:
+            QMessageBox.critical(self, "خطأ", f"تعذر تحميل كفايات المجال: {exc}")
+        finally:
+            self.tbl_competence_majal.setUpdatesEnabled(True)
+            self.tbl_competence_matiere.setUpdatesEnabled(True)
 
     def on_competence_majal_selected(self):
         row = self.tbl_competence_majal.currentRow()
@@ -1346,8 +1375,8 @@ class CompetenceManagerDialog(QDialog):
 
         # ⬅️ استخدام الحقل المتعدد الأسطر (multiline) لكفاية المادة
         fields = [
-            ("اسم المادة (Matiere):", "line", ""),
-            ("نص كفاية المادة (Competence):", "multiline", "")
+            ("اسم المادة:", "line", ""),
+            ("نص كفاية المادة:", "multiline", "")
         ]
         dlg = EntryDialog("إضافة كفاية ومادة جديدة", fields, parent=self)
         if dlg.exec():
@@ -1380,8 +1409,8 @@ class CompetenceManagerDialog(QDialog):
         
         # ⬅️ استخدام الحقل المتعدد الأسطر (multiline) لكفاية المادة
         fields = [
-            ("اسم المادة (Matiere):", "line", item_matiere.text()),
-            ("نص كفاية المادة (Competence):", "multiline", item_comp.text())
+            ("اسم المادة:", "line", item_matiere.text()),
+            ("نص كفاية المادة:", "multiline", item_comp.text())
         ]
         dlg = EntryDialog("تعديل المادة وكفايتها", fields, parent=self)
         if dlg.exec():
@@ -1620,7 +1649,9 @@ class OfficialProgramsWidget(QWidget):
             
         layout.addLayout(form)
         
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox()
+        btns.addButton("موافق", QDialogButtonBox.AcceptRole)
+        btns.addButton("إلغاء", QDialogButtonBox.RejectRole)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
@@ -2103,7 +2134,9 @@ class OfficialProgramsWidget(QWidget):
         form.addRow(label_text, txt)
         layout.addLayout(form)
         
-        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns = QDialogButtonBox()
+        btns.addButton("موافق", QDialogButtonBox.AcceptRole)
+        btns.addButton("إلغاء", QDialogButtonBox.RejectRole)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
@@ -2382,10 +2415,10 @@ class SchoolPlanner(QMainWindow):
         export_odt_action = QAction("تصدير إلى ملف PDF", self)
         export_odt_action.triggered.connect(self.export_odt_from_db_dialog)
 
-        export_json_action = QAction("تصدير يوم", self)
+        export_json_action = QAction("تصدير يوم بصيغة JSON", self)
         export_json_action.triggered.connect(self.export_day_to_json)
 
-        import_json_action = QAction("استيراد يوم", self)
+        import_json_action = QAction("استيراد يوم من JSON", self)
         import_json_action.triggered.connect(self.import_day_from_json)
 
         export_year_action = QAction("تصدير سنة دراسية كاملة (JSON)", self)
@@ -2416,11 +2449,11 @@ class SchoolPlanner(QMainWindow):
         prog_menu.addAction(open_prog_action)
         prog_menu.addSeparator()
 
-        self.export_prog_action = QAction("تصدير مكونات الكفاية (JSON)", self)
+        self.export_prog_action = QAction("تصدير البرامج الرسمية كاملة (JSON)", self)
         self.export_prog_action.triggered.connect(self.export_programs_json)
         prog_menu.addAction(self.export_prog_action)
 
-        self.import_prog_action = QAction("استيراد مكونات الكفاية (JSON)", self)
+        self.import_prog_action = QAction("استيراد البرامج الرسمية من JSON", self)
         self.import_prog_action.triggered.connect(self.import_programs_json)
         prog_menu.addAction(self.import_prog_action)
 
@@ -3128,7 +3161,7 @@ class SchoolPlanner(QMainWindow):
     def import_day_from_json(self):
         import json
         from PySide6.QtWidgets import QFileDialog
-        file_path, _ = QFileDialog.getOpenFileName(self, "اختيار ملف JSON للاستيراد", str(APP_DIR), "JSON Files (*.json);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "اختيار ملف JSON للاستيراد", str(APP_DIR), "ملفات JSON (*.json);;كل الملفات (*)")
         if not file_path:
             return
         try:
@@ -3164,44 +3197,79 @@ class SchoolPlanner(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "خطأ في الاستيراد", f"حدث خطأ أثناء قراءة أو استيراد ملف JSON:\n{e}")
 
+    @staticmethod
+    def _single_json_drop_path(event):
+        """أرجع مسار ملف JSON واحد فقط، وتجاهل السحب الداخلي والعناصر الأخرى."""
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return None
+        urls = mime.urls()
+        if len(urls) != 1:
+            return None
+        path = urls[0].toLocalFile()
+        if not path or Path(path).suffix.lower() != ".json":
+            return None
+        return path
+
+    @staticmethod
+    def _classify_json_payload(data):
+        """تصنيف ملفات التطبيق حتى لا تختلط نسخة البرامج الرسمية بملفات الأيام."""
+        if not isinstance(data, dict):
+            return None
+        if data.get("format") == "almo3in_official_programs":
+            return "official_full"
+        if isinstance(data.get("programs"), list) and isinstance(data.get("levels"), list) and isinstance(data.get("majals"), list):
+            return "official_full"
+        if "moukawan_kifaya" in data and "matiere" in data:
+            return "official_tree"
+        if isinstance(data.get("days"), list) or ("school_info" in data and "date" not in data):
+            return "school_year"
+        if "date" in data and isinstance(data.get("lessons"), list):
+            return "school_day"
+        return None
+
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if len(urls) == 1 and urls[0].toLocalFile().endswith('.json'):
-                event.acceptProposedAction()
-                return
-        event.ignore()
+        # نقبل الملفات الخارجية بصيغة JSON فقط؛ السحب الداخلي بين عناصر الواجهة لا يُلتقط هنا.
+        path = self._single_json_drop_path(event)
+        if path:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event):
-        urls = event.mimeData().urls()
-        if urls:
-            file_path = urls[0].toLocalFile()
-            if file_path and file_path.endswith('.json'):
-                try:
-                    import json
-                    with open(file_path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    
-                    # التحقق من نوع البيانات بناءً على المفاتيح الموجودة في الملف
-                    if "moukawan_kifaya" in data or ("majal" in data and "matiere" in data and "days" not in data):
-                        # هذا ملف مكونات كفاية خاص بالبرامج الرسمية
-                        if self.pages_stack.currentWidget() != self.official_programs_page:
-                            self.pages_stack.setCurrentWidget(self.official_programs_page)
-                        self.import_programs_json(file_path)
-                    elif "days" in data or "school_info" in data and "date" not in data:
-                        # هذا ملف سنة دراسية كاملة
-                        self.process_json_import(file_path)
-                    elif "date" in data and "lessons" in data:
-                        # هذا ملف يوم دراسي واحد
-                        self.process_json_import(file_path)
-                    else:
-                        QMessageBox.warning(self, "خطأ في نوع الملف", "لم يتم التعرف على هيكل البيانات داخل ملف JSON المسحوب.")
-                except Exception as e:
-                    QMessageBox.critical(self, "خطأ", f"تعذر قراءة الملف:\n{e}")
+        file_path = self._single_json_drop_path(event)
+        if not file_path:
+            event.ignore()
+            return
+
+        try:
+            with open(file_path, "r", encoding="utf-8-sig") as source:
+                data = json.load(source)
+            payload_type = self._classify_json_payload(data)
+            if payload_type in ("official_full", "official_tree"):
+                self.pages_stack.setCurrentWidget(self.official_programs_page)
+                self.import_programs_json(file_path)
+            elif payload_type in ("school_year", "school_day"):
+                self.process_json_import(file_path)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "نوع ملف غير معروف",
+                    "لم يتعرّف التطبيق على محتوى الملف. اسحب ملف JSON صادرًا عن التطبيق أو عن صفحة البرامج الرسمية.",
+                )
+                event.ignore()
+                return
+            event.acceptProposedAction()
+        except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+            QMessageBox.critical(self, "تعذّر قراءة الملف", f"لم نتمكّن من قراءة ملف JSON:\n{exc}")
+            event.ignore()
+        except Exception as exc:
+            QMessageBox.critical(self, "خطأ أثناء الاستيراد", f"تعذّر استيراد الملف:\n{exc}")
+            event.ignore()
 
     def import_all_years_from_json(self):
         from PySide6.QtWidgets import QFileDialog
-        file_path, _ = QFileDialog.getOpenFileName(self, "اختيار ملف JSON السنوي للاستيراد", str(Path.home() / "Documents"), "JSON Files (*.json);;All Files (*)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "اختيار ملف JSON السنوي للاستيراد", str(Path.home() / "Documents"), "ملفات JSON (*.json);;كل الملفات (*)")
         if not file_path:
             return
         self.process_json_import(file_path)
@@ -3502,193 +3570,438 @@ class SchoolPlanner(QMainWindow):
         
 
     def update_prog_actions_state(self):
-        """التحقق من تفعيل خيارات التصدير والاستيراد بناءً على الصفحة الحالية والفلترة"""
-        is_page_active = (self.pages_stack.currentWidget() == self.official_programs_page)
-        has_selection = (
-            is_page_active and
-            getattr(self.official_programs_page, 'selected_level_id', None) is not None and
-            getattr(self.official_programs_page, 'selected_majal_id', None) is not None and
-            getattr(self.official_programs_page, 'selected_competence_matiere_id', None) is not None
-        )
-        self.export_prog_action.setEnabled(has_selection)
-        self.import_prog_action.setEnabled(has_selection)
+        """التصدير والاستيراد الشاملان لا يتطلبان تحديد مادة بعينها."""
+        self.export_prog_action.setEnabled(True)
+        self.import_prog_action.setEnabled(True)
 
     def export_programs_json(self):
-        import json
+        """تصدير كامل البرامج الرسمية، من المستويات إلى المحتويات، في ملف JSON واحد."""
         from PySide6.QtWidgets import QFileDialog
-        
-        matiere_id = self.official_programs_page.selected_competence_matiere_id
-        if not matiere_id:
-            return
+
+        documents_dir = Path.home() / "Documents"
+        start_dir = documents_dir if documents_dir.exists() else Path.home()
+        default_name = start_dir / f"البرامج_الرسمية_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
         try:
             with self.db.connect() as con:
-                cursor = con.cursor()
-                
-                # جلب بيانات المادة وكفاية المجال والمجال والمستوى
-                cursor.execute("""
-                    SELECT cm.matiere, cm.competence, cmajal.competence, m.name, l.name 
-                    FROM competence_matiere cm
-                    JOIN competence_majal cmajal ON cm.id_competence_majal = cmajal.id
-                    JOIN majal m ON cmajal.id_majal = m.id
-                    JOIN level l ON cmajal.id_level = l.id
-                    WHERE cm.id = ?
-                """, (matiere_id,))
-                row = cursor.fetchone()
-                if not row:
-                    return
-                
-                data = {
-                    "level": row[4],
-                    "majal": row[3],
-                    "competence_majal": row[2],
-                    "matiere": row[0],
-                    "competence_matiere": row[1],
-                    "moukawan_kifaya": []
-                }
-                
-                # جلب مكونات الكفاية والشجرة التابعة لها
-                cursor.execute("SELECT id, competence FROM moukawan_kifaya WHERE id_competence_matiere = ?", (matiere_id,))
-                moukawans = cursor.fetchall()
-                for mouk in moukawans:
-                    mouk_id, mouk_comp = mouk[0], mouk[1]
-                    mouk_dict = {
-                        "competence": mouk_comp,
-                        "objectif_specifique": []
-                    }
-                    
-                    cursor.execute("SELECT id, objectif_specifique, description FROM objectif_specifique WHERE id_moukawa_kifaya = ?", (mouk_id,))
-                    objs = cursor.fetchall()
-                    for obj in objs:
-                        obj_id, obj_text, obj_desc = obj[0], obj[1], obj[2]
-                        obj_dict = {
-                            "objectif_specifique": obj_text,
-                            "description": obj_desc or "",
-                            "content": []
-                        }
-                        
-                        cursor.execute("SELECT content, description FROM content WHERE id_objectif_specifique = ?", (obj_id,))
-                        cnts = cursor.fetchall()
-                        for cnt in cnts:
-                            obj_dict["content"].append({
-                                "content": cnt[0],
-                                "description": cnt[1] or ""
-                            })
-                        
-                        mouk_dict["objectif_specifique"].append(obj_dict)
-                    data["moukawan_kifaya"].append(mouk_dict)
+                levels = [row[0] for row in con.execute("SELECT name FROM level ORDER BY id").fetchall()]
+                majals = [row[0] for row in con.execute("SELECT name FROM majal ORDER BY id").fetchall()]
+
+                majal_comp_rows = con.execute(
+                    """SELECT cmj.id, cmj.competence, m.name, l.name
+                       FROM competence_majal cmj
+                       JOIN majal m ON m.id = cmj.id_majal
+                       JOIN level l ON l.id = cmj.id_level
+                       ORDER BY l.id, m.id, cmj.id"""
+                ).fetchall()
+                matiere_rows = con.execute(
+                    """SELECT id, matiere, competence, id_competence_majal
+                       FROM competence_matiere ORDER BY id"""
+                ).fetchall()
+                mouk_rows = con.execute(
+                    """SELECT id, competence, id_competence_matiere
+                       FROM moukawan_kifaya ORDER BY id"""
+                ).fetchall()
+                objectif_rows = con.execute(
+                    """SELECT id, objectif_specifique, description, id_moukawa_kifaya
+                       FROM objectif_specifique ORDER BY id"""
+                ).fetchall()
+                content_rows = con.execute(
+                    """SELECT content, description, id_objectif_specifique
+                       FROM content ORDER BY id"""
+                ).fetchall()
+
+            contents_by_objectif = {}
+            for content_text, description, objectif_id in content_rows:
+                contents_by_objectif.setdefault(objectif_id, []).append({
+                    "content": content_text or "", "description": description or ""
+                })
+
+            objectifs_by_mouk = {}
+            for objectif_id, objectif_text, description, mouk_id in objectif_rows:
+                objectifs_by_mouk.setdefault(mouk_id, []).append({
+                    "objectif_specifique": objectif_text or "",
+                    "description": description or "",
+                    "content": contents_by_objectif.get(objectif_id, []),
+                })
+
+            mouk_by_matiere = {}
+            for mouk_id, competence, matiere_id in mouk_rows:
+                mouk_by_matiere.setdefault(matiere_id, []).append({
+                    "competence": competence or "",
+                    "objectif_specifique": objectifs_by_mouk.get(mouk_id, []),
+                })
+
+            matieres_by_competence_majal = {}
+            for matiere_id, matiere, competence, competence_majal_id in matiere_rows:
+                matieres_by_competence_majal.setdefault(competence_majal_id, []).append({
+                    "matiere": matiere or "",
+                    "competence_matiere": competence or "",
+                    "moukawan_kifaya": mouk_by_matiere.get(matiere_id, []),
+                })
+
+            programs = []
+            for cmj_id, competence_majal, majal_name, level_name in majal_comp_rows:
+                programs.append({
+                    "level": level_name,
+                    "majal": majal_name,
+                    "competence_majal": competence_majal or "",
+                    "matieres": matieres_by_competence_majal.get(cmj_id, []),
+                })
+
+            payload = {
+                "format": "almo3in_official_programs",
+                "version": 1,
+                "exported_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "levels": levels,
+                "majals": majals,
+                "programs": programs,
+            }
 
             file_path, _ = QFileDialog.getSaveFileName(
-                self, "تصدير شجرة مكونات الكفاية", 
-                str(Path.home() / "Documents" / f"competence_tree_{row[0]}.json"), 
-                "JSON Files (*.json);;All Files (*)"
+                self,
+                "تصدير البرامج الرسمية كاملة",
+                str(default_name),
+                "ملفات JSON (*.json);;كل الملفات (*)",
             )
-            if file_path:
-                with open(file_path, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                QMessageBox.information(self, "نجاح التصدير", f"تم تصدير الشجرة الكاملة لمكونات الكفاية بنجاح إلى:\n{file_path}")
-        except Exception as e:
-            QMessageBox.critical(self, "خطأ في التصدير", f"حدث خطأ أثناء تصدير البيانات:\n{e}")
+            if not file_path:
+                return
+            if Path(file_path).suffix.lower() != ".json":
+                file_path += ".json"
+            target = Path(file_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open("w", encoding="utf-8") as output:
+                json.dump(payload, output, ensure_ascii=False, indent=2)
+                output.write("\n")
 
+            QMessageBox.information(
+                self, "تمّ التصدير",
+                f"تمّ تصدير البرامج الرسمية كاملة بنجاح.\nعدد المستويات: {len(levels)}\nعدد المجالات: {len(majals)}\nعدد كفايات المجالات: {len(programs)}\nالملف: {target}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "تعذّر التصدير", f"حدث خطأ أثناء تصدير البرامج الرسمية:\n{exc}")
 
     def import_programs_json(self, file_path=None):
-        import json
+        """استيراد نسخة كاملة، مع دعم ملفات الشجرة القديمة للحفاظ على التوافق."""
         from PySide6.QtWidgets import QFileDialog
-        
-        matiere_id = self.official_programs_page.selected_competence_matiere_id
-        if not matiere_id:
-            return
 
         if not file_path:
+            documents_dir = Path.home() / "Documents"
+            start_dir = documents_dir if documents_dir.exists() else Path.home()
             file_path, _ = QFileDialog.getOpenFileName(
-                self, "اختيار ملف JSON لاستيراد مكونات الكفاية", 
-                str(Path.home() / "Documents"), 
-                "JSON Files (*.json);;All Files (*)"
+                self,
+                "استيراد البرامج الرسمية من ملف JSON",
+                str(start_dir),
+                "ملفات JSON (*.json);;كل الملفات (*)",
             )
             if not file_path:
                 return
 
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            
-            file_majal = data.get("majal", "").strip()
-            file_matiere = data.get("matiere", "").strip()
-            
-            with self.db.connect() as con:
-                cursor = con.cursor()
-                cursor.execute("""
-                    SELECT m.name, cm.matiere 
-                    FROM competence_matiere cm
-                    JOIN competence_majal cmajal ON cm.id_competence_majal = cmajal.id
-                    JOIN majal m ON cmajal.id_majal = m.id
-                    WHERE cm.id = ?
-                """, (matiere_id,))
-                current_info = cursor.fetchone()
-                
-                if current_info:
-                    current_majal, current_matiere = current_info[0].strip(), current_info[1].strip()
-                    
-                    if (file_majal and file_majal != current_majal) or (file_matiere and file_matiere != current_matiere):
-                        QMessageBox.warning(
-                            self, 
-                            "خطأ في مطابقة البيانات", 
-                            f"لا يمكن الاستيراد! الملف يتبع:\n(المجال: {file_majal} — النشاط/المادة: {file_matiere})\n\nبينما التحديد الحالي في البرنامج يتبع:\n(المجال: {current_majal} — النشاط/المادة: {current_matiere})."
-                        )
-                        return
+            with open(file_path, "r", encoding="utf-8-sig") as source:
+                data = json.load(source)
+            payload_type = self._classify_json_payload(data)
 
-                # مسح البيانات السابقة أولاً
-                cursor.execute("DELETE FROM moukawan_kifaya WHERE id_competence_matiere = ?", (matiere_id,))
-                
-                # إدراج البيانات الجديدة من الملف
-                for mouk in data.get("moukawan_kifaya", []):
-                    if isinstance(mouk, str):
-                        mouk_text = mouk
-                        objs_list = []
-                    else:
-                        mouk_text = mouk.get("competence", "")
-                        objs_list = mouk.get("objectif_specifique", [])
+            if payload_type == "official_full":
+                answer = QMessageBox.question(
+                    self,
+                    "تأكيد استبدال البرامج الرسمية",
+                    "سيُستبدل محتوى البرامج الرسمية الحالي بالكامل بالمحتوى الموجود في الملف، بما يشمل المستويات والمجالات والكفايات والأهداف والمحتويات.\n\nيُنصح بتصدير نسخة احتياطية قبل المتابعة. هل تريد مواصلة الاستيراد؟",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+                counts = self._restore_full_official_programs(data)
+                self.pages_stack.setCurrentWidget(self.official_programs_page)
+                self.official_programs_page.load_levels_and_majals()
+                QMessageBox.information(
+                    self, "تمّ الاستيراد",
+                    "تمّ استيراد البرامج الرسمية بنجاح.\n"
+                    f"المستويات: {counts['levels']}، المجالات: {counts['majals']}، "
+                    f"كفايات المجالات: {counts['competences_majal']}، المواد: {counts['matieres']}، "
+                    f"مكوّنات الكفاية: {counts['moukawan']}، الأهداف: {counts['objectifs']}، المحتويات: {counts['contents']}."
+                )
+                return
 
-                    cursor.execute(
-                        "INSERT INTO moukawan_kifaya (competence, id_competence_matiere) VALUES (?, ?)",
-                        (mouk_text, matiere_id)
+            if payload_type == "official_tree":
+                page = self.official_programs_page
+                matiere_id = page.selected_competence_matiere_id
+                if not matiere_id:
+                    QMessageBox.warning(
+                        self, "لم تُحدّد المادة",
+                        "هذا الملف يحتوي على شجرة كفاية واحدة. افتح البرامج الرسمية وحدّد المستوى والمجال والمادة المستهدفة، ثم أعد الاستيراد.",
                     )
-                    new_mouk_id = cursor.lastrowid
-                    
-                    for obj in objs_list:
-                        if isinstance(obj, str):
-                            obj_text = obj
-                            obj_desc = ""
-                            cnts_list = []
+                    return
+                imported = self._import_single_competence_tree(data, matiere_id)
+                if not imported:
+                    return
+                page.load_moukawan_data()
+                QMessageBox.information(self, "تمّ الاستيراد", "تمّ استيراد شجرة الكفاية المحددة بنجاح.")
+                return
+
+            QMessageBox.warning(
+                self, "ملف غير صالح",
+                "لا يحتوي الملف على نسخة برامج رسمية معروفة أو شجرة كفاية قابلة للاستيراد.",
+            )
+        except (OSError, json.JSONDecodeError, UnicodeError) as exc:
+            QMessageBox.critical(self, "تعذّر قراءة الملف", f"لم نتمكّن من قراءة ملف JSON:\n{exc}")
+        except Exception as exc:
+            QMessageBox.critical(self, "تعذّر الاستيراد", f"حدث خطأ أثناء استيراد البرامج الرسمية:\n{exc}")
+
+    def _restore_full_official_programs(self, data):
+        """استعادة نسخة كاملة داخل معاملة واحدة؛ يُلغى التغيير كله عند وقوع خطأ."""
+        if not isinstance(data, dict):
+            raise ValueError("يجب أن تكون بيانات ملف النسخة الاحتياطية كائن JSON.")
+        if data.get("format") not in (None, "almo3in_official_programs"):
+            raise ValueError("صيغة ملف البرامج الرسمية غير مدعومة.")
+        if data.get("format") == "almo3in_official_programs" and data.get("version") != 1:
+            raise ValueError("إصدار ملف البرامج الرسمية غير مدعوم.")
+        if not all(key in data for key in ("levels", "majals", "programs")):
+            raise ValueError("ملف النسخة الاحتياطية ناقص؛ لم يقع تغيير قاعدة البيانات.")
+        levels_data = data["levels"]
+        majals_data = data["majals"]
+        programs = data["programs"]
+        if not all(isinstance(value, list) for value in (levels_data, majals_data, programs)):
+            raise ValueError("بنية ملف النسخة الاحتياطية غير سليمة.")
+
+        def get_name(value):
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, dict):
+                return str(value.get("name", "")).strip()
+            return ""
+
+        level_names = list(dict.fromkeys(name for name in map(get_name, levels_data) if name))
+        majal_names = list(dict.fromkeys(name for name in map(get_name, majals_data) if name))
+        for program in programs:
+            if not isinstance(program, dict):
+                raise ValueError("توجد كفاية مجال بصيغة غير سليمة داخل الملف.")
+            level_name = str(program.get("level", "")).strip()
+            majal_name = str(program.get("majal", "")).strip()
+            if level_name and level_name not in level_names:
+                level_names.append(level_name)
+            if majal_name and majal_name not in majal_names:
+                majal_names.append(majal_name)
+            if not isinstance(program.get("matieres", []), list):
+                raise ValueError("قائمة المواد في الملف غير سليمة.")
+
+        counts = {
+            "levels": 0, "majals": 0, "competences_majal": 0, "matieres": 0,
+            "moukawan": 0, "objectifs": 0, "contents": 0,
+        }
+        with self.db.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            # حذف مرتب لتبقى العلاقات سليمة حتى عند تعطيل بعض قيود الحماية خارج التطبيق.
+            con.execute("DELETE FROM content")
+            con.execute("DELETE FROM objectif_specifique")
+            con.execute("DELETE FROM moukawan_kifaya")
+            con.execute("DELETE FROM competence_matiere")
+            con.execute("DELETE FROM competence_majal")
+            con.execute("DELETE FROM level")
+            con.execute("DELETE FROM majal")
+
+            level_ids = {}
+            for name in level_names:
+                con.execute("INSERT OR IGNORE INTO level(name) VALUES(?)", (name,))
+                level_ids[name] = con.execute("SELECT id FROM level WHERE name=?", (name,)).fetchone()[0]
+            counts["levels"] = len(level_ids)
+
+            majal_ids = {}
+            for name in majal_names:
+                con.execute("INSERT OR IGNORE INTO majal(name) VALUES(?)", (name,))
+                majal_ids[name] = con.execute("SELECT id FROM majal WHERE name=?", (name,)).fetchone()[0]
+            counts["majals"] = len(majal_ids)
+
+            for program in programs:
+                level_name = str(program.get("level", "")).strip()
+                majal_name = str(program.get("majal", "")).strip()
+                competence_majal = str(program.get("competence_majal", "")).strip()
+                if not level_name or not majal_name or not competence_majal:
+                    # تجاهل كفايات المجال غير المكتملة بدلاً من إنشاء سجلات عديمة الفائدة.
+                    continue
+                level_id = level_ids[level_name]
+                majal_id = majal_ids[majal_name]
+                con.execute(
+                    "INSERT OR IGNORE INTO competence_majal(competence, id_majal, id_level) VALUES(?,?,?)",
+                    (competence_majal, majal_id, level_id),
+                )
+                cmj_id = con.execute(
+                    "SELECT id FROM competence_majal WHERE competence=? AND id_majal=? AND id_level=?",
+                    (competence_majal, majal_id, level_id),
+                ).fetchone()[0]
+                counts["competences_majal"] += 1
+
+                for matiere in program.get("matieres", []):
+                    if not isinstance(matiere, dict):
+                        raise ValueError("توجد مادة بصيغة غير سليمة داخل الملف.")
+                    matiere_name = str(matiere.get("matiere", "")).strip()
+                    competence_matiere = str(matiere.get("competence_matiere", "")).strip()
+                    if not matiere_name or not competence_matiere:
+                        continue
+                    con.execute(
+                        "INSERT OR IGNORE INTO competence_matiere(matiere, competence, id_competence_majal) VALUES(?,?,?)",
+                        (matiere_name, competence_matiere, cmj_id),
+                    )
+                    matiere_id = con.execute(
+                        "SELECT id FROM competence_matiere WHERE matiere=? AND competence=? AND id_competence_majal=?",
+                        (matiere_name, competence_matiere, cmj_id),
+                    ).fetchone()[0]
+                    counts["matieres"] += 1
+
+                    mouk_list = matiere.get("moukawan_kifaya", [])
+                    if not isinstance(mouk_list, list):
+                        raise ValueError("قائمة مكوّنات الكفاية غير سليمة.")
+                    for mouk in mouk_list:
+                        if isinstance(mouk, str):
+                            mouk_text, objectifs = mouk.strip(), []
+                        elif isinstance(mouk, dict):
+                            mouk_text = str(mouk.get("competence", "")).strip()
+                            objectifs = mouk.get("objectif_specifique", [])
+                            if not isinstance(objectifs, list):
+                                raise ValueError("قائمة الأهداف المميزة غير سليمة.")
                         else:
-                            obj_text = obj.get("objectif_specifique", "")
-                            obj_desc = obj.get("description", "")
-                            cnts_list = obj.get("content", [])
-
-                        cursor.execute(
-                            "INSERT INTO objectif_specifique (objectif_specifique, id_moukawa_kifaya, description) VALUES (?, ?, ?)",
-                            (obj_text, new_mouk_id, obj_desc)
+                            raise ValueError("يوجد مكوّن كفاية بصيغة غير سليمة.")
+                        if not mouk_text:
+                            continue
+                        con.execute(
+                            "INSERT OR IGNORE INTO moukawan_kifaya(competence, id_competence_matiere) VALUES(?,?)",
+                            (mouk_text, matiere_id),
                         )
-                        new_obj_id = cursor.lastrowid
-                        
-                        for cnt in cnts_list:
-                            if isinstance(cnt, str):
-                                cnt_text = cnt
-                                cnt_desc = ""
-                            else:
-                                cnt_text = cnt.get("content", "")
-                                cnt_desc = cnt.get("description", "")
+                        mouk_id = con.execute(
+                            "SELECT id FROM moukawan_kifaya WHERE competence=? AND id_competence_matiere=?",
+                            (mouk_text, matiere_id),
+                        ).fetchone()[0]
+                        counts["moukawan"] += 1
 
-                            cursor.execute(
-                                "INSERT INTO content (content, id_objectif_specifique, description) VALUES (?, ?, ?)",
-                                (cnt_text, new_obj_id, cnt_desc)
+                        for objectif in objectifs:
+                            if isinstance(objectif, str):
+                                objectif_text, description, contents = objectif.strip(), "", []
+                            elif isinstance(objectif, dict):
+                                objectif_text = str(objectif.get("objectif_specifique", "")).strip()
+                                description = str(objectif.get("description", "") or "")
+                                contents = objectif.get("content", [])
+                                if not isinstance(contents, list):
+                                    raise ValueError("قائمة المحتويات غير سليمة.")
+                            else:
+                                raise ValueError("يوجد هدف مميز بصيغة غير سليمة.")
+                            if not objectif_text:
+                                continue
+                            con.execute(
+                                "INSERT OR IGNORE INTO objectif_specifique(objectif_specifique, id_moukawa_kifaya, description) VALUES(?,?,?)",
+                                (objectif_text, mouk_id, description),
                             )
-                con.commit()
-            
-            self.official_programs_page.load_moukawan_data()
-            QMessageBox.information(self, "نجاح الاستيراد", "تم مسح البيانات السابقة بنجاح، واستيراد الشجرة الجديدة بواسطة السحب والإفلات.")
-        except Exception as e:
-            QMessageBox.critical(self, "خطأ في الاستيراد", f"حدث خطأ أثناء قراءة أو استيراد ملف JSON:\n{e}")
+                            objectif_id = con.execute(
+                                "SELECT id FROM objectif_specifique WHERE objectif_specifique=? AND id_moukawa_kifaya=?",
+                                (objectif_text, mouk_id),
+                            ).fetchone()[0]
+                            counts["objectifs"] += 1
+
+                            for content in contents:
+                                if isinstance(content, str):
+                                    content_text, content_description = content.strip(), ""
+                                elif isinstance(content, dict):
+                                    content_text = str(content.get("content", "")).strip()
+                                    content_description = str(content.get("description", "") or "")
+                                else:
+                                    raise ValueError("يوجد محتوى بصيغة غير سليمة.")
+                                if not content_text:
+                                    continue
+                                con.execute(
+                                    "INSERT OR IGNORE INTO content(content, id_objectif_specifique, description) VALUES(?,?,?)",
+                                    (content_text, objectif_id, content_description),
+                                )
+                                counts["contents"] += 1
+            con.commit()
+        return counts
+
+    def _import_single_competence_tree(self, data, matiere_id):
+        """توافق رجعي مع ملفات JSON القديمة التي تصدّر شجرة مادة واحدة."""
+        file_majal = str(data.get("majal", "")).strip()
+        file_matiere = str(data.get("matiere", "")).strip()
+        with self.db.connect() as con:
+            current_info = con.execute(
+                """SELECT m.name, cm.matiere
+                   FROM competence_matiere cm
+                   JOIN competence_majal cmj ON cmj.id = cm.id_competence_majal
+                   JOIN majal m ON m.id = cmj.id_majal
+                   WHERE cm.id = ?""",
+                (matiere_id,),
+            ).fetchone()
+            if not current_info:
+                raise ValueError("المادة المحددة لم تعد موجودة في قاعدة البيانات.")
+            current_majal, current_matiere = current_info[0].strip(), current_info[1].strip()
+            if (file_majal and file_majal != current_majal) or (file_matiere and file_matiere != current_matiere):
+                raise ValueError(
+                    "لا تتطابق بيانات الملف مع المادة المحددة.\n"
+                    f"الملف: المجال {file_majal}، المادة {file_matiere}.\n"
+                    f"التحديد الحالي: المجال {current_majal}، المادة {current_matiere}."
+                )
+            tree = data.get("moukawan_kifaya", [])
+            if not isinstance(tree, list):
+                raise ValueError("قائمة مكوّنات الكفاية في الملف غير سليمة.")
+            answer = QMessageBox.question(
+                self,
+                "تأكيد استبدال شجرة الكفاية",
+                "سيتم حذف الشجرة الحالية للمادة المحددة وتعويضها بالشجرة الموجودة في الملف. هل تواصل؟",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+
+            con.execute("BEGIN IMMEDIATE")
+            con.execute("DELETE FROM moukawan_kifaya WHERE id_competence_matiere = ?", (matiere_id,))
+            for mouk in tree:
+                if isinstance(mouk, str):
+                    mouk_text, objectifs = mouk.strip(), []
+                elif isinstance(mouk, dict):
+                    mouk_text = str(mouk.get("competence", "")).strip()
+                    objectifs = mouk.get("objectif_specifique", [])
+                else:
+                    raise ValueError("يوجد مكوّن كفاية بصيغة غير سليمة.")
+                if not mouk_text:
+                    continue
+                cur = con.execute(
+                    "INSERT INTO moukawan_kifaya(competence, id_competence_matiere) VALUES(?,?)",
+                    (mouk_text, matiere_id),
+                )
+                new_mouk_id = cur.lastrowid
+                if not isinstance(objectifs, list):
+                    raise ValueError("قائمة الأهداف المميزة غير سليمة.")
+                for obj in objectifs:
+                    if isinstance(obj, str):
+                        obj_text, obj_desc, contents = obj.strip(), "", []
+                    elif isinstance(obj, dict):
+                        obj_text = str(obj.get("objectif_specifique", "")).strip()
+                        obj_desc = str(obj.get("description", "") or "")
+                        contents = obj.get("content", [])
+                    else:
+                        raise ValueError("يوجد هدف مميز بصيغة غير سليمة.")
+                    if not obj_text:
+                        continue
+                    if not isinstance(contents, list):
+                        raise ValueError("قائمة المحتويات غير سليمة.")
+                    obj_cur = con.execute(
+                        "INSERT INTO objectif_specifique(objectif_specifique, id_moukawa_kifaya, description) VALUES(?,?,?)",
+                        (obj_text, new_mouk_id, obj_desc),
+                    )
+                    new_obj_id = obj_cur.lastrowid
+                    for cnt in contents:
+                        if isinstance(cnt, str):
+                            cnt_text, cnt_desc = cnt.strip(), ""
+                        elif isinstance(cnt, dict):
+                            cnt_text = str(cnt.get("content", "")).strip()
+                            cnt_desc = str(cnt.get("description", "") or "")
+                        else:
+                            raise ValueError("يوجد محتوى بصيغة غير سليمة.")
+                        if cnt_text:
+                            con.execute(
+                                "INSERT INTO content(content, id_objectif_specifique, description) VALUES(?,?,?)",
+                                (cnt_text, new_obj_id, cnt_desc),
+                            )
+            con.commit()
+        return True
 
 
 def load_custom_font():
