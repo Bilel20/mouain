@@ -34,7 +34,7 @@ from PySide6.QtCore import QDate, QLocale, QStringListModel
 from PySide6.QtGui import QAction, QTextOption
 from PySide6.QtPrintSupport import QPrintDialog, QPrintPreviewDialog
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QStackedWidget,
     QGridLayout, QSplitter, QGroupBox, QLabel, QLineEdit, QComboBox, QSpinBox,
     QDateEdit, QTimeEdit, QTableWidget, QTableWidgetItem, QPushButton,
     QMessageBox, QDialog, QDialogButtonBox, QTextEdit, QHeaderView, QAbstractItemView, QCompleter,
@@ -45,14 +45,13 @@ from PySide6.QtWidgets import QCalendarWidget
 from PySide6.QtGui import QColor, QPainter, QFontDatabase
 
 # ---------------------------------------------------------
-2# إدارة المسارات بشكل آمن ودقيق (يعمل مع الكود العادي و PyInstaller)
+# إدارة المسارات بشكل آمن ودقيق (يعمل مع الكود العادي و PyInstaller)
 # ---------------------------------------------------------
 if hasattr(sys, '_MEIPASS'):
     BASE_DIR = Path(sys._MEIPASS)
 else:
     BASE_DIR = Path(__file__).resolve().parent
 
-# تحديد المسارات المطلوبة للملفات الخارجية
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "school_data.db"
 ICON_PATH = BASE_DIR / "icons" / "icon.ico"
@@ -114,7 +113,72 @@ class Database:
                 nachat_id INTEGER NOT NULL,
                 FOREIGN KEY(nachat_id) REFERENCES nachat(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS level (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS majal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE
+            );
+
+            CREATE TABLE IF NOT EXISTS competence_majal (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                competence TEXT NOT NULL,
+                id_majal INTEGER NOT NULL,
+                id_level INTEGER NOT NULL,
+                FOREIGN KEY(id_majal) REFERENCES majal(id) ON DELETE CASCADE,
+                FOREIGN KEY(id_level) REFERENCES level(id) ON DELETE CASCADE,
+                UNIQUE(competence, id_majal, id_level)
+            );
+
+            CREATE TABLE IF NOT EXISTS competence_matiere (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                matiere TEXT NOT NULL,
+                competence TEXT NOT NULL,
+                id_competence_majal INTEGER NOT NULL,
+                FOREIGN KEY(id_competence_majal) REFERENCES competence_majal(id) ON DELETE CASCADE,
+                UNIQUE(matiere, competence, id_competence_majal)
+            );
+
+            CREATE TABLE IF NOT EXISTS moukawan_kifaya (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                competence TEXT NOT NULL,
+                id_competence_matiere INTEGER NOT NULL,
+                FOREIGN KEY(id_competence_matiere) REFERENCES competence_matiere(id) ON DELETE CASCADE,
+                UNIQUE(competence, id_competence_matiere)
+            );
+
+            CREATE TABLE IF NOT EXISTS objectif_specifique (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                objectif_specifique TEXT NOT NULL,
+                id_moukawa_kifaya INTEGER NOT NULL,
+                description TEXT DEFAULT '',
+                FOREIGN KEY(id_moukawa_kifaya) REFERENCES moukawan_kifaya(id) ON DELETE CASCADE,
+                UNIQUE(objectif_specifique, id_moukawa_kifaya)
+            );
+
+            CREATE TABLE IF NOT EXISTS content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                id_objectif_specifique INTEGER NOT NULL,
+                description TEXT DEFAULT '',
+                FOREIGN KEY(id_objectif_specifique) REFERENCES objectif_specifique(id) ON DELETE CASCADE,
+                UNIQUE(content, id_objectif_specifique)
+            );
             """)
+
+            c.executescript("""
+            DELETE FROM level WHERE id NOT IN (
+                SELECT MIN(id) FROM level GROUP BY name
+            );
+            DELETE FROM majal WHERE id NOT IN (
+                SELECT MIN(id) FROM majal GROUP BY name
+            );
+            """)
+
             row = c.execute("SELECT id FROM ann_scolaire ORDER BY id LIMIT 1").fetchone()
             if row:
                 self.year_id = row[0]
@@ -215,23 +279,6 @@ class Database:
             c.execute("""UPDATE ann_scolaire SET nom_annee=?,nom_ecole=?,nom_enseignant=?,
                 nom_inspecteur=?,grade=? WHERE id=?""", (*values, self.year_id))
 
-    def printable_day(self, day_id):
-        with self.connect() as c:
-            lessons = c.execute("""SELECT id,hessa_number,classe,majal,heure,time,
-                wehda_number,namat_taallom FROM hessa WHERE day_data_id=?
-                ORDER BY id ASC""", (day_id,)).fetchall()
-            result = []
-            for lesson in lessons:
-                acts = c.execute("SELECT id,title,time FROM nachat WHERE hessa_id=? ORDER BY id",
-                                 (lesson[0],)).fetchall()
-                act_result = []
-                for act in acts:
-                    det = c.execute("""SELECT key_name,value_text FROM nachat_detail
-                        WHERE nachat_id=? ORDER BY id""", (act[0],)).fetchall()
-                    act_result.append((act[1], act[2], det))
-                result.append((lesson, act_result))
-            return result
-
     def get_latest_date(self):
         with self.connect() as c:
             row = c.execute(
@@ -301,80 +348,6 @@ class SchoolDataFormatter:
             except ValueError:
                 continue
         return date_str
-
-    def get_formatted_day_text(self, date_str: str) -> str:
-        formatted_db_date = self.normalize_date(date_str)
-        with self.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT 
-                    d.id AS day_id, d.date,
-                    a.nom_annee, a.nom_ecole, a.nom_enseignant, a.nom_inspecteur, a.grade
-                FROM day_data d
-                JOIN ann_scolaire a ON d.ann_scolaire_id = a.id
-                WHERE d.date = ?
-            """, (formatted_db_date,))
-            day_row = cursor.fetchone()
-
-            if not day_row:
-                return f"❌ لم يتم العثور على أي بيانات مسجلة للتاريخ: {date_str}"
-
-            date_obj = datetime.strptime(day_row['date'], "%Y-%m-%d")
-            days_ar = ["الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
-            months_ar = ["جانفي", "فيفري", "مارس", "أفريل", "ماي", "جوان", "جويلية", "أوت", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
-            
-            day_name = days_ar[date_obj.weekday()]
-            month_name = months_ar[date_obj.month - 1]
-            formatted_date_header = f"اليوم : {day_name} {date_obj.day} {month_name} {date_obj.year}"
-
-            lines = []
-            lines.append(".ـ" * 60)
-            spaces = " " * 30
-            lines.append(f"{spaces} 📌 {formatted_date_header}")
-            lines.append("ـ." * 60)
-
-            cursor.execute("""
-                SELECT id, classe, majal, heure, time, wehda_number, hessa_number, namat_taallom
-                FROM hessa
-                WHERE day_data_id = ?
-                ORDER BY id ASC
-            """, (day_row['day_id'],))
-            hessa_rows = cursor.fetchall()
-
-            if not hessa_rows:
-                lines.append("\n  ⚠️ لا توجد حصص مسجلة لهذا اليوم.")
-            else:
-                for h_idx, h in enumerate(hessa_rows, 1):
-                    lines.append(f"\n📘 الحصة: {h['majal']} | القسم: {h['classe']}")
-                    lines.append(f"   ├─ التوقيت: {h['heure']} ({h['time']})")
-                    lines.append(f"   ├─ الوحدة عدد: {h['wehda_number']} | الحصة / اليوم / المقطع: {h['hessa_number']} | نمط التعلم: {h['namat_taallom']}")
-                    lines.append("   └─ الأنشطة:")
-
-                    cursor.execute("""
-                        SELECT id, title, time
-                        FROM nachat
-                        WHERE hessa_id = ?
-                        ORDER BY id ASC
-                    """, (h['id'],))
-                    nachat_rows = cursor.fetchall()
-
-                    if not nachat_rows:
-                        lines.append("      └── (لا توجد أنشطة مسجلة لهذه الحصة)")
-                    else:
-                        for n_idx, n in enumerate(nachat_rows, 1):
-                            lines.append(f"      ├─ 📌 النشاط {n_idx}: {n['title']} (المدة: {n['time']})")
-                            cursor.execute("""
-                                SELECT key_name, value_text
-                                FROM nachat_detail
-                                WHERE nachat_id = ?
-                                ORDER BY id ASC
-                            """, (n['id'],))
-                            detail_rows = cursor.fetchall()
-                            for d in detail_rows:
-                                lines.append(f"      │  ├── {d['key_name']}: {d['value_text']}")
-
-            lines.append("\n" + "ـ." * 60)
-            return "\n".join(lines)
 
 
 class YearImportDialog(QDialog):
@@ -503,7 +476,6 @@ class AutoCompletionTextEdit(QTextEdit):
             return ""
         key_name = self.key_combo.currentText()
         try:
-            # 1. جلب البيانات السابقة باستخدام pandas بناءً على الخاصية ونوع النشاط
             with self.db.connect() as con:
                 df = pd.read_sql_query("""
                     SELECT d.value_text 
@@ -512,7 +484,6 @@ class AutoCompletionTextEdit(QTextEdit):
                     WHERE d.key_name = ? AND n.title = ? AND COALESCE(d.value_text, '') <> ''
                 """, con, params=(key_name, self.activity_title))
             
-            # إذا لم توجد بيانات كافية لنفس النشاط، نبحث في نفس الخاصية عموماً
             if df.empty:
                 with self.db.connect() as con:
                     df = pd.read_sql_query("""
@@ -527,15 +498,11 @@ class AutoCompletionTextEdit(QTextEdit):
             text_series = df['value_text'].astype(str)
             current_stripped = current_text.strip()
 
-            # 2. المطابقة المباشرة للجمل والعبارات (مثال: كتب "المت" فتكتمل إلى "المتعلم")
             matches = text_series[text_series.str.startswith(current_stripped, na=False)]
             if not matches.empty:
-                # اختيار الجملة الأكثر تكراراً باستخدام pandas
                 most_frequent = matches.value_counts().index[0]
                 return most_frequent
 
-            # 3. التحليل الذكي للكلمات المتتابعة (N-grams / Successors)
-            # استخراج كافة الكلمات والثنائيات (Bigrams) لتحليل ما يذكر عادة بعد الكلمات
             tokens_list = []
             bigrams = []
             for text in text_series:
@@ -547,8 +514,6 @@ class AutoCompletionTextEdit(QTextEdit):
             current_tokens = current_stripped.split()
             if current_tokens:
                 last_typed_word = current_tokens[-1]
-                
-                # أ) إكمال الكلمة الحالية الجزئية (إذا كانت تطابق بداية كلمة مسجلة)
                 matching_tokens = [t for t in tokens_list if t.startswith(last_typed_word) and t != last_typed_word]
                 if matching_tokens:
                     best_token = pd.Series(matching_tokens).mode().iloc[0]
@@ -557,7 +522,6 @@ class AutoCompletionTextEdit(QTextEdit):
                     else:
                         return best_token
 
-                # ب) التنبؤ بالكلمة التالية بناءً على الكلمة السابقة (مثال: إذا كتب "حل" يتم اقتراح "مشكل")
                 if len(current_tokens) >= 1:
                     prev_word = current_tokens[-1]
                     next_words = [b[1] for b in bigrams if b[0] == prev_word]
@@ -568,6 +532,7 @@ class AutoCompletionTextEdit(QTextEdit):
         except Exception as e:
             print(f"Pandas Completion error: {e}")
         return ""
+
 
 class CustomCalendarWidget(QCalendarWidget):
     def __init__(self, db, parent=None):
@@ -601,9 +566,6 @@ class CustomCalendarWidget(QCalendarWidget):
             print(f"Error loading recorded dates: {e}")
 
 
-from datetime import datetime, time
-from PySide6.QtCore import QTime
-
 class LessonEntryDialog(QDialog):
     def __init__(self, title, df_history, weekday_num=None, default_values=None, parent=None):
         super().__init__(parent)
@@ -611,7 +573,7 @@ class LessonEntryDialog(QDialog):
         self.setMinimumWidth(520)
         self.df_history = df_history
         self.weekday_num = weekday_num
-        self.is_updating = False  # لمنع الحلقات اللانهائية عند التحديث المتبادل
+        self.is_updating = False
         
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -661,7 +623,6 @@ class LessonEntryDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
         
-        # ربط الأحداث مع الدوال الذكية
         self.combo_classe.currentTextChanged.connect(self.on_classe_changed)
         self.combo_majal.currentTextChanged.connect(self.on_majal_changed)
         self.combo_heure.currentTextChanged.connect(self.on_heure_changed)
@@ -685,7 +646,6 @@ class LessonEntryDialog(QDialog):
             self.on_classe_changed(self.combo_classe.currentText())
 
     def load_day_specific_heures(self):
-        """جلب التوقيتات المسجلة سابقاً لنفس يوم الأسبوع (مثل الخميس)"""
         if self.df_history is None or self.df_history.empty or self.weekday_num is None:
             return
         try:
@@ -701,7 +661,6 @@ class LessonEntryDialog(QDialog):
             print(f"Error loading day specific heures: {e}")
 
     def on_classe_changed(self, classe_text):
-        """حين يتغير القسم، يستخدم Pandas للبحث في قاعدة البيانات عن المجالات والتوقيتات المرتبطة به في ذلك اليوم"""
         if self.is_updating or self.df_history is None or self.df_history.empty:
             return
         self.is_updating = True
@@ -709,11 +668,8 @@ class LessonEntryDialog(QDialog):
             df = self.df_history.copy()
             df['date'] = pd.to_datetime(df['date'], errors='coerce')
             df['wd'] = df['date'].dt.dayofweek
-            
-            # فلترة حسب القسم ونفس اليوم
             df_sub = df[(df['classe'] == classe_text) & (df['wd'] == self.weekday_num)]
             if df_sub.empty:
-                # إذا لم توجد سجلات لنفس اليوم لهذا القسم، نبحث في القسم عموماً
                 df_sub = df[df['classe'] == classe_text]
 
             if not df_sub.empty:
@@ -736,15 +692,12 @@ class LessonEntryDialog(QDialog):
             self.is_updating = False
 
     def on_majal_changed(self, majal_text):
-        """حين يختار المستخدم المجال، يبحث Pandas عن التوقيت الذي دُرس فيه هذا المجال سابقاً"""
         if self.is_updating or not majal_text.strip() or self.df_history is None or self.df_history.empty:
             return
         self.is_updating = True
         try:
             df = self.df_history.copy()
             classe_text = self.combo_classe.currentText().strip()
-            
-            # البحث عن التوقيت المرتبط بهذا المجال وهذا القسم
             df_sub = df[(df['majal'] == majal_text) & (df['classe'] == classe_text)]
             if df_sub.empty:
                 df_sub = df[df['majal'] == majal_text]
@@ -754,7 +707,6 @@ class LessonEntryDialog(QDialog):
                 if heures:
                     self.combo_heure.clear()
                     self.combo_heure.addItems(heures)
-                    # اختيار التوقيت الأكثر تكراراً (Mode) لهذا المجال
                     mode_heure = df_sub['heure'].mode()
                     if not mode_heure.empty:
                         self.combo_heure.setCurrentText(str(mode_heure.iloc[0]))
@@ -764,11 +716,8 @@ class LessonEntryDialog(QDialog):
             self.is_updating = False
 
     def on_heure_changed(self, heure_text):
-        """حين يختار المستخدم التوقيت، يبحث Pandas عن المجال الذي كان يُدَرَّس في هذا التوقيت سابقاً + حساب الفارق الزمني"""
         if self.is_updating or not heure_text.strip():
             return
-        
-        # 1. حساب الفارق الزمني آلياً
         cleaned_text = heure_text.replace(" ", "").replace("ـ", "-")
         if "-" in cleaned_text:
             parts = cleaned_text.split("-")
@@ -782,15 +731,12 @@ class LessonEntryDialog(QDialog):
                 except ValueError:
                     pass
 
-        # 2. البحث الذكي عن المجال المرتبط بهذا التوقيت باستخدام Pandas
         if self.df_history is None or self.df_history.empty:
             return
-        
         self.is_updating = True
         try:
             df = self.df_history.copy()
             classe_text = self.combo_classe.currentText().strip()
-            
             df_sub = df[(df['heure'] == heure_text) & (df['classe'] == classe_text)]
             if df_sub.empty:
                 df_sub = df[df['heure'] == heure_text]
@@ -807,7 +753,6 @@ class LessonEntryDialog(QDialog):
             self.is_updating = False
 
     def validate_and_accept(self):
-        """التحقق من صحة التوقيت وأنه محصور بين 07:00 و 17:00"""
         heure_text = self.combo_heure.currentText().strip().replace(" ", "").replace("ـ", "-")
         if "-" in heure_text:
             parts = heure_text.split("-")
@@ -815,32 +760,17 @@ class LessonEntryDialog(QDialog):
                 try:
                     t1 = datetime.strptime(parts[0].strip(), "%H:%M").time()
                     t2 = datetime.strptime(parts[1].strip(), "%H:%M").time()
-                    
                     work_start = time(7, 0)
                     work_end = time(17, 0)
-                    
                     if not (work_start <= t1 <= work_end and work_start <= t2 <= work_end):
-                        QMessageBox.warning(
-                            self, 
-                            "توقيت غير مقبول", 
-                            "عذراً، أوقات العمل الرسمية يجب أن تكون محصورة حصراً بين الساعة **07:00** صباحاً و **17:00** مساءً."
-                        )
+                        QMessageBox.warning(self, "توقيت غير مقبول", "أوقات العمل الرسمية بين 07:00 و 17:00.")
                         return
                     if t2 <= t1:
                         QMessageBox.warning(self, "خطأ في التوقيت", "وقت النهاية يجب أن يكون بعد وقت البداية.")
                         return
                 except ValueError:
-                    QMessageBox.warning(
-                        self, 
-                        "توقيت غير صالح", 
-                        "صيغة التوقيت غير مقبولة. يرجى إدخال التوقيت بالصيغة الصحيحة (مثال: 08:00-09:30)."
-                    )
+                    QMessageBox.warning(self, "توقيت غير صالح", "صيغة التوقيت غير مقبولة (مثال: 08:00-09:30).")
                     return
-        else:
-            if heure_text:
-                QMessageBox.warning(self, "توقيت غير مقبول", "يرجى كتابة التوقيت بصيغة نطاق صحيح يحتوي على علامة الشارطة (-) مثل 08:00-09:00.")
-                return
-
         self.accept()
 
     def values(self):
@@ -859,7 +789,7 @@ class EntryDialog(QDialog):
     def __init__(self, title, fields, values=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(480)
         self.widgets = []
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -873,7 +803,7 @@ class EntryDialog(QDialog):
                 w = QTextEdit()
                 w.setAcceptRichText(False)
                 w.setPlainText(str(default or ""))
-                w.setMaximumHeight(100)
+                w.setMinimumHeight(100)
             else:
                 w = QLineEdit(str(default or ""))
             self.widgets.append(w)
@@ -908,42 +838,34 @@ class EntryDialog(QDialog):
                 result.append(w.text().strip())
         return result
 
+
 class DaySelectionDialog(QDialog):
     def __init__(self, db, parent=None):
         super().__init__(parent)
         self.setWindowTitle("اختيار يوم للتصدير")
-        # ⬅️ زيادة العرض والارتفاع لتبدو الأيام والتقويم مريحة وواضحة
         self.setMinimumWidth(480)
         self.setMinimumHeight(520)
         self.db = db
         
         layout = QVBoxLayout(self)
-        
-        # إضافة عنوان توضيحي
         info_label = QLabel("اختر اليوم المطلوب تصديره من التقويم أدناه:")
         info_label.setStyleSheet("font-weight: bold; color: #2c3e50; font-size: 11px;")
         layout.addWidget(info_label)
         
-        # إضافة التقويم المخصص الذي يميز الأيام المسجلة
         self.calendar = CustomCalendarWidget(self.db, self)
         layout.addWidget(self.calendar)
-
-        # ⬅️ ضبط لغة التقويم لتكون العربية (تونس) لضمان ظهور أسماء الأيام والأشهر بالعربية
-        arabic_locale = QLocale(QLocale.Arabic, QLocale.Tunisia)
-        self.calendar.setLocale(arabic_locale)
+        self.calendar.setLocale(QLocale(QLocale.Arabic, QLocale.Tunisia))
         
-        # أزرار الحوار (موافق / إلغاء)
         buttons = QDialogButtonBox()
         self.export_btn = buttons.addButton("تصدير الملف", QDialogButtonBox.AcceptRole)
         buttons.addButton("إلغاء", QDialogButtonBox.RejectRole)
-        
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
     def get_selected_date_str(self):
-        # إرجاع التاريخ المختار بصيغة yyyy-MM-dd
         return self.calendar.selectedDate().toString("yyyy-MM-dd")
+
 
 ACTIVITIES_BY_MAJAL = {
     "اللغة العربية": ["تواصل شفوي", "قراءة", "إنتاج كتابي", "استعمال قواعد اللغة",
@@ -974,15 +896,13 @@ class ActivityEntryDialog(QDialog):
 
         self.title_combo = QComboBox()
         self.title_combo.setEditable(True)
-        self.title_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.title_combo.addItems(ACTIVITIES_BY_MAJAL.get(self.majal, []))
         self.title_combo.setCurrentText(values[0] if values else "")
+        
         self.time_combo = QComboBox()
         self.time_combo.setEditable(True)
         self.time_combo.addItems(["5 دقائق", "10 دقائق", "15 دقيقة", "20 دقيقة",
                                   "30 دقيقة", "45 دقيقة", "60 دقيقة"])
-        if not values:
-            self.time_combo.setCurrentText("")
         form.addRow("عنوان النشاط", self.title_combo)
         form.addRow("المدة", self.time_combo)
         layout.addLayout(form)
@@ -997,7 +917,6 @@ class ActivityEntryDialog(QDialog):
         self.title_combo.currentTextChanged.connect(self.update_duration_suggestion)
         if values:
             self.time_combo.setCurrentText(str(values[1] or ""))
-        self.update_duration_suggestion(self.title_combo.currentText())
 
     def update_duration_suggestion(self, activity_title):
         if not activity_title.strip():
@@ -1028,8 +947,7 @@ class ActivityEntryDialog(QDialog):
             print(f"Activity duration prediction error: {exc}")
 
     def values(self):
-        return [self.title_combo.currentText().strip(),
-                self.time_combo.currentText().strip()]
+        return [self.title_combo.currentText().strip(), self.time_combo.currentText().strip()]
 
 
 class DetailEntryDialog(QDialog):
@@ -1044,7 +962,6 @@ class DetailEntryDialog(QDialog):
         form = QFormLayout()
 
         self.key_combo = QComboBox()
-        self.key_combo.setEditable(False)
         self.key_combo.addItems(DETAIL_KEYS_BY_NAMAT.get(self.namat, []))
         
         if not values and self.activity_title:
@@ -1056,7 +973,6 @@ class DetailEntryDialog(QDialog):
 
         self.value_edit = AutoCompletionTextEdit(self.db, self.key_combo, self.activity_title)
         self.value_edit.setPlaceholderText("أدخل قيمة الخاصية هنا… ابدأ الكتابة للاقتراح والتثبيت بـ Tab...")
-        
         font_metrics = self.value_edit.fontMetrics()
         self.value_edit.setFixedHeight(font_metrics.lineSpacing() * 5 + 12)
 
@@ -1081,8 +997,1121 @@ class DetailEntryDialog(QDialog):
     def values(self):
         return [self.key_combo.currentText().strip(), self.value_edit.toPlainText().strip()]
 
+class CompetenceManagerDialog(QDialog):
+    def __init__(self, db=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("إدارة كفايات المجالات والمواد الدراسية")
+        # ⬅️ زيادة عرض وارتفاع النافذة لتكون أوسع وأكثر راحة
+        self.resize(1200, 750)
+        self.setLayoutDirection(Qt.RightToLeft)
+        
+        self.db = db if db else Database(DB_PATH)
+        
+        self.selected_level_id = None
+        self.selected_majal_id = None
+        self.selected_competence_majal_id = None
+        self.copied_majal_data = None
 
-from PySide6.QtWidgets import QStackedWidget
+        self.init_ui()
+        self.load_levels_and_majals()
+
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+
+        title_label = QLabel("🎯 لوحة إدارة كفايات المجالات والمواد الدراسية")
+        title_label.setStyleSheet("font-size: 15px; font-weight: bold; color: #1E40AF; padding: 5px;")
+        main_layout.addWidget(title_label)
+
+        filters_box = QGroupBox("فلترة واختيار المستوى والمجال")
+        filters_layout = QHBoxLayout(filters_box)
+
+        self.combo_level = QComboBox()
+        self.combo_level.currentIndexChanged.connect(self.on_filter_changed)
+
+        self.combo_majal = QComboBox()
+        self.combo_majal.currentIndexChanged.connect(self.on_filter_changed)
+
+        filters_layout.addWidget(QLabel("المستوى الدراسي:"))
+        filters_layout.addWidget(self.combo_level, 1)
+        filters_layout.addWidget(QLabel("المجال:"))
+        filters_layout.addWidget(self.combo_majal, 1)
+
+        main_layout.addWidget(filters_box)
+
+        splitter = QSplitter(Qt.Horizontal)
+
+        # جدول كفاية المجال
+        majal_widget = QWidget()
+        majal_layout = QVBoxLayout(majal_widget)
+        majal_layout.addWidget(QLabel("<b>1. كفاية المجال </b>"))
+        
+        majal_btns_layout = QHBoxLayout()
+        for text, slot, act_type in [
+            ("＋ إضافة", self.add_competence_majal, "add"), 
+            ("✎ تعديل", self.edit_competence_majal, "edit"), 
+            ("－ حذف", self.delete_competence_majal, "delete"),
+            ("📋 نسخ الكل", self.copy_majal_with_matieres, "copy_paste"),
+            ("📌 لصق وتحديث", self.paste_majal_with_matieres, "copy_paste")
+        ]:
+            b = QPushButton(text)
+            b.setMinimumWidth(110)  # ⬅️ زيادة عرض الأزرار
+            b.setProperty("actionType", act_type)
+            b.clicked.connect(slot)
+            majal_btns_layout.addWidget(b)
+        majal_layout.addLayout(majal_btns_layout)
+
+        self.tbl_competence_majal = self.create_clean_table(["كفاية المجال"])
+        self.tbl_competence_majal.itemSelectionChanged.connect(self.on_competence_majal_selected)
+        majal_layout.addWidget(self.tbl_competence_majal)
+        splitter.addWidget(majal_widget)
+
+        # جدول كفايات المواد
+        matiere_widget = QWidget()
+        matiere_layout = QVBoxLayout(matiere_widget)
+        matiere_layout.addWidget(QLabel("<b>2. كفايات المواد المرتبطة بكفاية المجال المختارة (Competence Matiere)</b>"))
+        
+        matiere_btns_layout = QHBoxLayout()
+        for text, slot, act_type in [
+            ("＋ إضافة مادة/كفاية", self.add_competence_matiere, "add"), 
+            ("✎ تعديل", self.edit_competence_matiere, "edit"), 
+            ("－ حذف", self.delete_competence_matiere, "delete")
+        ]:
+            b = QPushButton(text)
+            b.setMinimumWidth(130)  # ⬅️ زيادة عرض الأزرار
+            b.setProperty("actionType", act_type)
+            b.clicked.connect(slot)
+            matiere_btns_layout.addWidget(b)
+        matiere_layout.addLayout(matiere_btns_layout)
+
+        self.tbl_competence_matiere = self.create_clean_table(["المادة (Matiere)", "كفاية المادة"])
+        matiere_layout.addWidget(self.tbl_competence_matiere)
+        splitter.addWidget(matiere_widget)
+
+        splitter.setSizes([520, 580])
+        main_layout.addWidget(splitter, 1)
+
+        close_btn = QPushButton("إغلاق")
+        close_btn.setStyleSheet("background-color: #EF4444; color: white; font-weight: bold; padding: 6px 16px; border-radius: 6px;")
+        close_btn.clicked.connect(self.accept)
+        
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(close_btn)
+        main_layout.addLayout(bottom_layout)
+
+    def create_clean_table(self, headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        return table
+
+    def load_levels_and_majals(self):
+        try:
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                self.combo_level.blockSignals(True)
+                self.combo_level.clear()
+                for lid, lname in cursor.execute("SELECT id, name FROM level").fetchall():
+                    self.combo_level.addItem(lname, lid)
+                self.combo_level.blockSignals(False)
+
+                self.combo_majal.blockSignals(True)
+                self.combo_majal.clear()
+                for mid, mname in cursor.execute("SELECT id, name FROM majal").fetchall():
+                    self.combo_majal.addItem(mname, mid)
+                self.combo_majal.blockSignals(False)
+
+            self.on_filter_changed()
+        except Exception as e:
+            print(f"Error loading filters in manager: {e}")
+
+    def on_filter_changed(self):
+        self.selected_level_id = self.combo_level.currentData()
+        self.selected_majal_id = self.combo_majal.currentData()
+        self.load_competence_majal_data()
+
+    def load_competence_majal_data(self):
+        self.tbl_competence_majal.setRowCount(0)
+        self.tbl_competence_matiere.setRowCount(0)
+        
+        if not self.selected_level_id or not self.selected_majal_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                for row in con.execute("""
+                    SELECT id, competence FROM competence_majal 
+                    WHERE id_majal = ? AND id_level = ?
+                """, (self.selected_majal_id, self.selected_level_id)).fetchall():
+                    r = self.tbl_competence_majal.rowCount()
+                    self.tbl_competence_majal.insertRow(r)
+                    item = QTableWidgetItem(row[1])
+                    item.setData(Qt.UserRole, row[0])
+                    self.tbl_competence_majal.setItem(r, 0, item)
+                
+                if self.tbl_competence_majal.rowCount() > 0:
+                    self.tbl_competence_majal.selectRow(0)
+        except Exception as e:
+            print(f"Error loading competence_majal: {e}")
+
+    def on_competence_majal_selected(self):
+        row = self.tbl_competence_majal.currentRow()
+        if row < 0:
+            self.selected_competence_majal_id = None
+            self.tbl_competence_matiere.setRowCount(0)
+            return
+        
+        item = self.tbl_competence_majal.item(row, 0)
+        self.selected_competence_majal_id = item.data(Qt.UserRole)
+        self.load_competence_matiere_data()
+
+    def load_competence_matiere_data(self):
+        self.tbl_competence_matiere.setRowCount(0)
+        if not self.selected_competence_majal_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                for row in con.execute("""
+                    SELECT id, matiere, competence FROM competence_matiere 
+                    WHERE id_competence_majal = ?
+                """, (self.selected_competence_majal_id,)).fetchall():
+                    r = self.tbl_competence_matiere.rowCount()
+                    self.tbl_competence_matiere.insertRow(r)
+                    
+                    item_matiere = QTableWidgetItem(row[1])
+                    item_matiere.setData(Qt.UserRole, row[0])
+                    item_comp = QTableWidgetItem(row[2])
+                    
+                    self.tbl_competence_matiere.setItem(r, 0, item_matiere)
+                    self.tbl_competence_matiere.setItem(r, 1, item_comp)
+        except Exception as e:
+            print(f"Error loading competence_matiere: {e}")
+
+    def copy_majal_with_matieres(self):
+        if not self.selected_competence_majal_id:
+            if self.tbl_competence_majal.rowCount() > 0:
+                self.tbl_competence_majal.selectRow(0)
+            else:
+                QMessageBox.warning(self, "تنبيه", "لا توجد كفاية مجال مسجلة في هذا المستوى والمجال لنسخها.")
+                return
+
+        row = self.tbl_competence_majal.currentRow()
+        item = self.tbl_competence_majal.item(row, 0)
+        majal_competence_text = item.text()
+
+        matieres_list = []
+        try:
+            with self.db.connect() as con:
+                for r in con.execute("""
+                    SELECT matiere, competence FROM competence_matiere 
+                    WHERE id_competence_majal = ?
+                """, (self.selected_competence_majal_id,)).fetchall():
+                    matieres_list.append({"matiere": r[0], "competence": r[1]})
+
+            self.copied_majal_data = {
+                "competence": majal_competence_text,
+                "matieres": matieres_list
+            }
+            QMessageBox.information(self, "نجاح النسخ", f"تم نسخ كفاية المجال مع {len(matieres_list)} من كفايات المواد التابعة لها بنجاح.")
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء نسخ البيانات:\n{e}")
+
+    def paste_majal_with_matieres(self):
+        if not self.copied_majal_data:
+            QMessageBox.warning(self, "تنبيه", "لا توجد بيانات منسوخة حالياً في الذاكرة.")
+            return
+        if not self.selected_level_id or not self.selected_majal_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى اختيار المستوى والمجال المستهدف للصق فيه.")
+            return
+
+        try:
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                cursor.execute("""
+                    SELECT id FROM competence_majal 
+                    WHERE id_majal = ? AND id_level = ?
+                """, (self.selected_majal_id, self.selected_level_id))
+                existing_row = cursor.fetchone()
+
+                if existing_row:
+                    majal_id = existing_row[0]
+                    cursor.execute("""
+                        UPDATE competence_majal 
+                        SET competence = ? 
+                        WHERE id = ?
+                    """, (self.copied_majal_data["competence"], majal_id))
+                    
+                    cursor.execute("""
+                        DELETE FROM competence_matiere 
+                        WHERE id_competence_majal = ?
+                    """, (majal_id,))
+                else:
+                    cursor.execute("""
+                        INSERT INTO competence_majal (competence, id_majal, id_level) 
+                        VALUES (?, ?, ?)
+                    """, (self.copied_majal_data["competence"], self.selected_majal_id, self.selected_level_id))
+                    majal_id = cursor.lastrowid
+
+                for mat in self.copied_majal_data["matieres"]:
+                    cursor.execute("""
+                        INSERT INTO competence_matiere (matiere, competence, id_competence_majal) 
+                        VALUES (?, ?, ?)
+                    """, (mat["matiere"], mat["competence"], majal_id))
+
+                con.commit()
+
+            self.load_competence_majal_data()
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء عملية اللصق:\n{e}")
+
+    def add_competence_majal(self):
+        if not self.selected_level_id or not self.selected_majal_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد المستوى والمجال أولاً.")
+            return
+
+        # ⬅️ استخدام الحقل المتعدد الأسطر (multiline)
+        fields = [("نص كفاية المجال:", "multiline", "")]
+        dlg = EntryDialog("إضافة كفاية مجال جديدة", fields, parent=self)
+        if dlg.exec():
+            vals = dlg.values()
+            if not vals[0]:
+                return
+            try:
+                with self.db.connect() as con:
+                    con.execute("""
+                        INSERT INTO competence_majal (competence, id_majal, id_level) 
+                        VALUES (?, ?, ?)
+                    """, (vals[0], self.selected_majal_id, self.selected_level_id))
+                    con.commit()
+                self.load_competence_majal_data()
+                # تم إزالة رسالة النجاح المنبثقة بناءً على طلبك
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الإضافة (قد تكون موجودة مسبقاً):\n{e}")
+
+    def edit_competence_majal(self):
+        row = self.tbl_competence_majal.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد كفاية المجال للتعديل.")
+            return
+        
+        item = self.tbl_competence_majal.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+        current_text = item.text()
+
+        # ⬅️ استخدام الحقل المتعدد الأسطر (multiline)
+        fields = [("تعديل نص كفاية المجال:", "multiline", current_text)]
+        dlg = EntryDialog("تعديل كفاية المجال", fields, parent=self)
+        if dlg.exec():
+            vals = dlg.values()
+            if not vals[0]:
+                return
+            try:
+                with self.db.connect() as con:
+                    con.execute("UPDATE competence_majal SET competence = ? WHERE id = ?", (vals[0], rec_id))
+                    con.commit()
+                self.load_competence_majal_data()
+                # تم إزالة رسالة النجاح المنبثقة
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء التحديث:\n{e}")
+
+    def delete_competence_majal(self):
+        row = self.tbl_competence_majal.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد كفاية المجال للحذف.")
+            return
+        
+        item = self.tbl_competence_majal.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+
+        if QMessageBox.question(self, "تأكيد الحذف", "حذف كفاية المجال سيؤدي لحذف كافة كفايات المواد والمكونات التابعة لها. هل أنت متأكد؟", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            try:
+                with self.db.connect() as con:
+                    con.execute("DELETE FROM competence_majal WHERE id = ?", (rec_id,))
+                    con.commit()
+                self.load_competence_majal_data()
+                self.tbl_competence_matiere.setRowCount(0)
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الحذف:\n{e}")
+
+    def add_competence_matiere(self):
+        if not self.selected_competence_majal_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد كفاية المجال أولاً.")
+            return
+
+        # ⬅️ استخدام الحقل المتعدد الأسطر (multiline) لكفاية المادة
+        fields = [
+            ("اسم المادة (Matiere):", "line", ""),
+            ("نص كفاية المادة (Competence):", "multiline", "")
+        ]
+        dlg = EntryDialog("إضافة كفاية ومادة جديدة", fields, parent=self)
+        if dlg.exec():
+            vals = dlg.values()
+            matiere, competence = vals[0], vals[1]
+            if not matiere or not competence:
+                QMessageBox.warning(self, "بيانات ناقصة", "اسم المادة وكفاية المادة حقلان أساسيان.")
+                return
+            try:
+                with self.db.connect() as con:
+                    con.execute("""
+                        INSERT INTO competence_matiere (matiere, competence, id_competence_majal) 
+                        VALUES (?, ?, ?)
+                    """, (matiere, competence, self.selected_competence_majal_id))
+                    con.commit()
+                self.load_competence_matiere_data()
+                # تم إزالة رسالة النجاح المنبثقة
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الإضافة (قد تكون المادة مسجلة مسبقاً بنفس السياق):\n{e}")
+
+    def edit_competence_matiere(self):
+        row = self.tbl_competence_matiere.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد السطر المراد تعديله.")
+            return
+        
+        item_matiere = self.tbl_competence_matiere.item(row, 0)
+        item_comp = self.tbl_competence_matiere.item(row, 1)
+        rec_id = item_matiere.data(Qt.UserRole)
+        
+        # ⬅️ استخدام الحقل المتعدد الأسطر (multiline) لكفاية المادة
+        fields = [
+            ("اسم المادة (Matiere):", "line", item_matiere.text()),
+            ("نص كفاية المادة (Competence):", "multiline", item_comp.text())
+        ]
+        dlg = EntryDialog("تعديل المادة وكفايتها", fields, parent=self)
+        if dlg.exec():
+            vals = dlg.values()
+            matiere, competence = vals[0], vals[1]
+            if not matiere or not competence:
+                QMessageBox.warning(self, "بيانات ناقصة", "جميع الحقول مطلوبة.")
+                return
+            try:
+                with self.db.connect() as con:
+                    con.execute("""
+                        UPDATE competence_matiere 
+                        SET matiere = ?, competence = ? 
+                        WHERE id = ?
+                    """, (matiere, competence, rec_id))
+                    con.commit()
+                self.load_competence_matiere_data()
+                # تم إزالة رسالة النجاح المنبثقة
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"حدث خطأ أثناء التحديث:\n{e}")
+
+    def delete_competence_matiere(self):
+        row = self.tbl_competence_matiere.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد المادة المراد حذفها.")
+            return
+        
+        item = self.tbl_competence_matiere.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+
+        if QMessageBox.question(self, "تأكيد الحذف", "هل أنت متأكد من حذف هذه المادة وكفايتها؟", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
+            try:
+                with self.db.connect() as con:
+                    con.execute("DELETE FROM competence_matiere WHERE id = ?", (rec_id,))
+                    con.commit()
+                self.load_competence_matiere_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الحذف:\n{e}")
+
+
+
+class OfficialProgramsWidget(QWidget):
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setLayoutDirection(Qt.RightToLeft)
+        
+        self.selected_level_id = None
+        self.selected_majal_id = None
+        self.selected_competence_matiere_id = None
+        self.selected_moukawan_id = None
+        self.selected_objectif_id = None
+
+        main_layout = QVBoxLayout(self)
+        title_label = QLabel("📚 إدارة البرامج الرسمية والمحتويات التربوية المتقدمة")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #1E40AF; padding: 5px;")
+        main_layout.addWidget(title_label)
+
+        filters_group = QGroupBox("الفلاتر واختيار البرامج")
+        filters_layout = QHBoxLayout(filters_group)
+
+        self.combo_level = QComboBox()
+        self.combo_level.currentIndexChanged.connect(self.on_level_changed)
+
+        self.combo_majal = QComboBox()
+        self.combo_majal.currentIndexChanged.connect(self.on_majal_changed)
+
+        self.combo_matiere = QComboBox()
+        self.combo_matiere.currentIndexChanged.connect(self.on_matiere_changed)
+
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("بحث في المواد...")
+        self.search_input.textChanged.connect(self.filter_matiere_combo)
+
+        filters_layout.addWidget(QLabel("المستوى:"))
+        filters_layout.addWidget(self.combo_level, 1)
+        filters_layout.addWidget(QLabel("المجال:"))
+        filters_layout.addWidget(self.combo_majal, 1)
+        filters_layout.addWidget(QLabel("المادة/الكفاية:"))
+        filters_layout.addWidget(self.combo_matiere, 2)
+        filters_layout.addWidget(QLabel("بحث:"))
+        filters_layout.addWidget(self.search_input, 1)
+
+        main_layout.addWidget(filters_group)
+
+        competences_group = QGroupBox("الكفايات الأساسية (المجال والمادة)")
+        comp_layout = QVBoxLayout(competences_group)
+
+        majal_comp_layout = QHBoxLayout()
+        self.txt_competence_majal = QLineEdit()
+        self.txt_competence_majal.setReadOnly(True)
+        btn_copy_majal = QPushButton("📋")
+        btn_copy_majal.setFixedWidth(60)
+        btn_copy_majal.clicked.connect(lambda: self.copy_text(self.txt_competence_majal))
+        
+        btn_edit_majal = QPushButton("✎")
+        btn_edit_majal.setFixedWidth(60)
+        btn_edit_majal.clicked.connect(self.edit_competence_majal)
+
+        majal_comp_layout.addWidget(QLabel("كفاية المجال:"))
+        majal_comp_layout.addWidget(self.txt_competence_majal, 1)
+        majal_comp_layout.addWidget(btn_copy_majal)
+        majal_comp_layout.addWidget(btn_edit_majal)
+        comp_layout.addLayout(majal_comp_layout)
+
+        matiere_comp_layout = QHBoxLayout()
+        self.txt_competence_matiere = QLineEdit()
+        self.txt_competence_matiere.setReadOnly(True)
+        btn_copy_matiere = QPushButton("📋")
+        btn_copy_matiere.setFixedWidth(60)
+        btn_copy_matiere.clicked.connect(lambda: self.copy_text(self.txt_competence_matiere))
+
+        btn_edit_matiere = QPushButton("✎")
+        btn_edit_matiere.setFixedWidth(60)
+        btn_edit_matiere.clicked.connect(self.edit_competence_matiere)
+
+        matiere_comp_layout.addWidget(QLabel("كفاية المادة:"))
+        matiere_comp_layout.addWidget(self.txt_competence_matiere, 1)
+        matiere_comp_layout.addWidget(btn_copy_matiere)
+        matiere_comp_layout.addWidget(btn_edit_matiere)
+        comp_layout.addLayout(matiere_comp_layout)
+
+        main_layout.addWidget(competences_group)
+
+        tables_splitter = QSplitter(Qt.Horizontal)
+
+        # 1. جدول مكونات الكفاية (مع التفاف النص وتوسيع الصفوف تلقائياً)
+        moukawan_widget = QGroupBox("مكونات الكفاية")
+        moukawan_layout = QVBoxLayout(moukawan_widget)
+        moukawan_btns = QHBoxLayout()
+        for text, slot, act_type in [
+            ("＋ إضافة", self.add_moukawan, "add"), 
+            ("✎ تعديل", self.edit_moukawan, "edit"), 
+            ("－ حذف", self.delete_moukawan, "delete"), 
+            ("📋 نسخ", self.copy_moukawan, "copy_paste"), 
+            ("📌 لصق", self.paste_moukawan, "copy_paste")
+        ]:
+            b = QPushButton(text)
+            b.setMinimumWidth(38)
+            b.setFixedHeight(28)
+            b.setProperty("actionType", act_type)
+            b.clicked.connect(slot)
+            moukawan_btns.addWidget(b)
+        moukawan_btns.addStretch()
+        
+        moukawan_layout.addLayout(moukawan_btns)
+        moukawan_layout.addSpacing(8)
+        self.tbl_moukawan = self.create_clean_table(["مكون الكفاية"])
+        self.tbl_moukawan.setWordWrap(True)
+        self.tbl_moukawan.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.tbl_moukawan.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl_moukawan.itemSelectionChanged.connect(self.on_moukawan_selected)
+        moukawan_layout.addWidget(self.tbl_moukawan)
+        tables_splitter.addWidget(moukawan_widget)
+
+        # 2. جدول الأهداف المميزة (مع التفاف النص وتوسيع الصفوف تلقائياً)
+        objectif_widget = QGroupBox("الأهداف المميزة")
+        objectif_layout = QVBoxLayout(objectif_widget)
+        objectif_btns = QHBoxLayout()
+        for text, slot, act_type in [
+            ("＋ إضافة", self.add_objectif, "add"), 
+            ("✎ تعديل", self.edit_objectif, "edit"), 
+            ("－ حذف", self.delete_objectif, "delete"), 
+            ("📋 نسخ", self.copy_objectif, "copy_paste"), 
+            ("📌 لصق", self.paste_objectif, "copy_paste")
+        ]:
+            b = QPushButton(text)
+            b.setMinimumWidth(38)
+            b.setFixedHeight(28)
+            b.setProperty("actionType", act_type)
+            b.clicked.connect(slot)
+            objectif_btns.addWidget(b)
+        objectif_btns.addStretch()
+        
+        objectif_layout.addLayout(objectif_btns)
+        objectif_layout.addSpacing(8)
+        self.tbl_objectif = self.create_clean_table(["الهدف المميز"])
+        self.tbl_objectif.setWordWrap(True)
+        self.tbl_objectif.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.tbl_objectif.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tbl_objectif.itemSelectionChanged.connect(self.on_objectif_selected)
+        objectif_layout.addWidget(self.tbl_objectif)
+        tables_splitter.addWidget(objectif_widget)
+
+        # 3. جدول المحتويات (مع التفاف النص وتوسيع الصفوف تلقائياً)
+        content_widget = QGroupBox("المحتويات")
+        content_layout = QVBoxLayout(content_widget)
+        content_btns = QHBoxLayout()
+        for text, slot, act_type in [
+            ("＋ إضافة", self.add_content, "add"), 
+            ("✎ تعديل", self.edit_content, "edit"), 
+            ("－ حذف", self.delete_content, "delete"), 
+            ("📋 نسخ", self.copy_content, "copy_paste"), 
+            ("📌 لصق", self.paste_content, "copy_paste")
+        ]:
+            b = QPushButton(text)
+            b.setMinimumWidth(38)
+            b.setFixedHeight(28)
+            b.setProperty("actionType", act_type)
+            b.clicked.connect(slot)
+            content_btns.addWidget(b)
+        content_btns.addStretch()
+        
+        content_layout.addLayout(content_btns)
+        content_layout.addSpacing(8)
+        self.tbl_content = self.create_clean_table(["المحتوى"])
+        self.tbl_content.setWordWrap(True)
+        self.tbl_content.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.tbl_content.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        content_layout.addWidget(self.tbl_content)
+        tables_splitter.addWidget(content_widget)
+
+        tables_splitter.setSizes([330, 330, 330])
+        main_layout.addWidget(tables_splitter, 1)
+
+        self.load_levels_and_majals()
+
+    def multi_input_dialog(self, title, fields_info):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(600)
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        
+        text_editors = []
+        for label_text, default_text in fields_info:
+            txt = QTextEdit()
+            txt.setAcceptRichText(False)
+            txt.setPlainText(default_text)
+            
+            font_metrics = txt.fontMetrics()
+            txt.setFixedHeight(font_metrics.lineSpacing() * 5 + 16)
+            
+            form.addRow(label_text, txt)
+            text_editors.append(txt)
+            
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        
+        if dlg.exec() == QDialog.Accepted:
+            results = [editor.toPlainText().strip() for editor in text_editors]
+            return results, True
+        return [], False
+
+    def create_clean_table(self, headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        return table
+
+    def load_levels_and_majals(self):
+        try:
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                self.combo_level.blockSignals(True)
+                self.combo_level.clear()
+                for lid, lname in cursor.execute("SELECT id, name FROM level").fetchall():
+                    self.combo_level.addItem(lname, lid)
+                self.combo_level.blockSignals(False)
+
+                self.combo_majal.blockSignals(True)
+                self.combo_majal.clear()
+                for mid, mname in cursor.execute("SELECT id, name FROM majal").fetchall():
+                    self.combo_majal.addItem(mname, mid)
+                self.combo_majal.blockSignals(False)
+
+            self.update_matieres_combo()
+        except Exception as e:
+            print(f"Error loading filters: {e}")
+
+    def on_level_changed(self):
+        self.selected_level_id = self.combo_level.currentData()
+        self.update_matieres_combo()
+
+    def on_majal_changed(self):
+        self.selected_majal_id = self.combo_majal.currentData()
+        self.update_matieres_combo()
+
+    def update_matieres_combo(self):
+        self.combo_matiere.blockSignals(True)
+        self.combo_matiere.clear()
+        self.selected_level_id = self.combo_level.currentData()
+        self.selected_majal_id = self.combo_majal.currentData()
+        
+        if not self.selected_level_id or not self.selected_majal_id:
+            self.combo_matiere.blockSignals(False)
+            return
+
+        try:
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                query = """
+                    cm.id, cm.matiere, cm.competence, cm.id_competence_majal,
+                    cmajal.competence AS majal_competence
+                    FROM competence_matiere cm
+                    JOIN competence_majal cmajal ON cm.id_competence_majal = cmajal.id
+                    WHERE cmajal.id_majal = ? AND cmajal.id_level = ?
+                """
+                search_text = self.search_input.text().strip()
+                params = [self.selected_majal_id, self.selected_level_id]
+                if search_text:
+                    query += " AND (cm.matiere LIKE ? OR cm.competence LIKE ?)"
+                    params.extend([f"%{search_text}%", f"%{search_text}%"])
+
+                for row in cursor.execute(f"SELECT {query}", params).fetchall():
+                    display_text = f"{row[1]} — {row[2]}"
+                    self.combo_matiere.addItem(display_text, {
+                        "competence_matiere_id": row[0],
+                        "matiere": row[1],
+                        "competence_matiere": row[2],
+                        "id_competence_majal": row[3],
+                        "majal_competence": row[4]
+                    })
+        except Exception as e:
+            print(f"Error updating matieres: {e}")
+        
+        self.combo_matiere.blockSignals(False)
+        self.on_matiere_changed()
+
+    def filter_matiere_combo(self, text):
+        self.update_matieres_combo()
+
+    def on_matiere_changed(self):
+        data = self.combo_matiere.currentData()
+        if not data:
+            self.txt_competence_majal.clear()
+            self.txt_competence_matiere.clear()
+            self.selected_competence_matiere_id = None
+            self.tbl_moukawan.setRowCount(0)
+            self.tbl_objectif.setRowCount(0)
+            self.tbl_content.setRowCount(0)
+            return
+
+        self.selected_competence_matiere_id = data["competence_matiere_id"]
+        self.txt_competence_majal.setText(data["majal_competence"])
+        self.txt_competence_matiere.setText(data["competence_matiere"])
+        self.load_moukawan_data()
+
+    def load_moukawan_data(self):
+        self.tbl_moukawan.setRowCount(0)
+        self.tbl_objectif.setRowCount(0)
+        self.tbl_content.setRowCount(0)
+        if not self.selected_competence_matiere_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                for row in con.execute("SELECT id, competence FROM moukawan_kifaya WHERE id_competence_matiere = ?", (self.selected_competence_matiere_id,)).fetchall():
+                    r = self.tbl_moukawan.rowCount()
+                    self.tbl_moukawan.insertRow(r)
+                    item_comp = QTableWidgetItem(row[1])
+                    item_comp.setData(Qt.UserRole, row[0])
+                    self.tbl_moukawan.setItem(r, 0, item_comp)
+            
+            # تكييف الارتفاع تلقائياً لعرض النصوص الطويلة بالكامل
+            self.tbl_moukawan.resizeRowsToContents()
+        except Exception as e:
+            print(f"Error loading moukawan: {e}")
+
+    def on_moukawan_selected(self):
+        row = self.tbl_moukawan.currentRow()
+        if row < 0:
+            self.selected_moukawan_id = None
+            self.tbl_objectif.setRowCount(0)
+            return
+        item = self.tbl_moukawan.item(row, 0)
+        self.selected_moukawan_id = item.data(Qt.UserRole) if item else None
+        self.load_objectif_data()
+
+    def load_objectif_data(self):
+        self.tbl_objectif.setRowCount(0)
+        self.tbl_content.setRowCount(0)
+        if not self.selected_moukawan_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                for row in con.execute("SELECT id, objectif_specifique, description FROM objectif_specifique WHERE id_moukawa_kifaya = ?", (self.selected_moukawan_id,)).fetchall():
+                    r = self.tbl_objectif.rowCount()
+                    self.tbl_objectif.insertRow(r)
+                    item_obj = QTableWidgetItem(row[1])
+                    item_obj.setData(Qt.UserRole, row[0])
+                    item_obj.setData(Qt.UserRole + 1, row[2] or "")
+                    self.tbl_objectif.setItem(r, 0, item_obj)
+            
+            self.tbl_objectif.resizeRowsToContents()
+        except Exception as e:
+            print(f"Error loading objectifs: {e}")
+
+    def on_objectif_selected(self):
+        row = self.tbl_objectif.currentRow()
+        if row < 0:
+            self.selected_objectif_id = None
+            self.tbl_content.setRowCount(0)
+            return
+        item = self.tbl_objectif.item(row, 0)
+        self.selected_objectif_id = item.data(Qt.UserRole) if item else None
+        self.load_content_data()
+
+    def load_content_data(self):
+        self.tbl_content.setRowCount(0)
+        if not self.selected_objectif_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                for row in con.execute("SELECT id, content, description FROM content WHERE id_objectif_specifique = ?", (self.selected_objectif_id,)).fetchall():
+                    r = self.tbl_content.rowCount()
+                    self.tbl_content.insertRow(r)
+                    item_cnt = QTableWidgetItem(row[1])
+                    item_cnt.setData(Qt.UserRole, row[0])
+                    item_cnt.setData(Qt.UserRole + 1, row[2] or "")
+                    self.tbl_content.setItem(r, 0, item_cnt)
+            
+            # تكييف الارتفاع تلقائياً لعرض النصوص الطويلة بالكامل
+            self.tbl_content.resizeRowsToContents()
+        except Exception as e:
+            print(f"Error loading contents: {e}")
+
+    def copy_text(self, line_edit):
+        line_edit.selectAll()
+        line_edit.copy()
+
+    def edit_competence_majal(self):
+        data = self.combo_matiere.currentData()
+        if not data:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد المادة أولاً.")
+            return
+        new_val, ok = self.input_dialog("تعديل كفاية المجال", "أدخل النص الجديد:", self.txt_competence_majal.text())
+        if ok and new_val:
+            try:
+                with self.db.connect() as con:
+                    con.execute("UPDATE competence_majal SET competence = ? WHERE id = ?", (new_val, data["id_competence_majal"]))
+                    con.commit()
+                self.update_matieres_combo()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر التحديث: {e}")
+
+    def edit_competence_matiere(self):
+        data = self.combo_matiere.currentData()
+        if not data:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد المادة أولاً.")
+            return
+        new_val, ok = self.input_dialog("تعديل كفاية المادة", "أدخل النص الجديد:", self.txt_competence_matiere.text())
+        if ok and new_val:
+            try:
+                with self.db.connect() as con:
+                    con.execute("UPDATE competence_matiere SET competence = ? WHERE id = ?", (new_val, data["competence_matiere_id"]))
+                    con.commit()
+                self.update_matieres_combo()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر التحديث: {e}")
+
+    def add_moukawan(self):
+        if not self.selected_competence_matiere_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى اختيار المادة أولاً.")
+            return
+        val, ok = self.input_dialog("إضافة مكون كفاية", "أدخل مكون الكفاية:")
+        if ok and val:
+            try:
+                with self.db.connect() as con:
+                    con.execute("INSERT INTO moukawan_kifaya (competence, id_competence_matiere) VALUES (?, ?)", (val, self.selected_competence_matiere_id))
+                    con.commit()
+                self.load_moukawan_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الإضافة: {e}")
+
+    def edit_moukawan(self):
+        row = self.tbl_moukawan.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد مكون كفاية للتعديل.")
+            return
+        item = self.tbl_moukawan.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+        val, ok = self.input_dialog("تعديل مكون الكفاية", "أدخل النص الجديد:", item.text())
+        if ok and val:
+            try:
+                with self.db.connect() as con:
+                    con.execute("UPDATE moukawan_kifaya SET competence = ? WHERE id = ?", (val, rec_id))
+                    con.commit()
+                self.load_moukawan_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر التعديل: {e}")
+
+    def delete_moukawan(self):
+        row = self.tbl_moukawan.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد مكون كفاية للحذف.")
+            return
+        item = self.tbl_moukawan.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+        if QMessageBox.question(self, "تأكيد", "هل أنت متأكد من الحذف؟") == QMessageBox.Yes:
+            try:
+                with self.db.connect() as con:
+                    con.execute("DELETE FROM moukawan_kifaya WHERE id = ?", (rec_id,))
+                    con.commit()
+                self.load_moukawan_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الحذف: {e}")
+
+    def copy_moukawan(self):
+        row = self.tbl_moukawan.currentRow()
+        if row >= 0:
+            item = self.tbl_moukawan.item(row, 0)
+            self.copied_moukawan_text = item.text()
+            QApplication.clipboard().setText(self.copied_moukawan_text)
+
+    def paste_moukawan(self):
+        if hasattr(self, 'copied_moukawan_text') and self.selected_competence_matiere_id:
+            try:
+                with self.db.connect() as con:
+                    con.execute("INSERT INTO moukawan_kifaya (competence, id_competence_matiere) VALUES (?, ?)", (self.copied_moukawan_text, self.selected_competence_matiere_id))
+                    con.commit()
+                self.load_moukawan_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر اللصق: {e}")
+
+    def add_objectif(self):
+        if not self.selected_moukawan_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى اختيار مكون كفاية أولاً.")
+            return
+            
+        fields = [
+            ("الهدف المميز:", ""),
+            ("الملاحظات:", "")
+        ]
+        vals, ok = self.multi_input_dialog("إضافة هدف مميز جديد", fields)
+        
+        if ok and vals[0]:
+            val = vals[0]
+            desc = vals[1]
+            try:
+                with self.db.connect() as con:
+                    con.execute(
+                        "INSERT INTO objectif_specifique (objectif_specifique, id_moukawa_kifaya, description) VALUES (?, ?, ?)", 
+                        (val, self.selected_moukawan_id, desc)
+                    )
+                    con.commit()
+                self.load_objectif_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الإضافة: {e}")
+
+    def edit_objectif(self):
+        row = self.tbl_objectif.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد هدف مميز للتعديل.")
+            return
+        item_obj = self.tbl_objectif.item(row, 0)
+        rec_id = item_obj.data(Qt.UserRole)
+        current_text = item_obj.text()
+        current_desc = item_obj.data(Qt.UserRole + 1) or ""
+        
+        fields = [
+            ("تعديل الهدف المميز:", current_text),
+            ("تعديل الملاحظات:", current_desc)
+        ]
+        vals, ok = self.multi_input_dialog("تعديل الهدف المميز", fields)
+        
+        if ok and vals[0]:
+            val = vals[0]
+            desc = vals[1]
+            try:
+                with self.db.connect() as con:
+                    con.execute(
+                        "UPDATE objectif_specifique SET objectif_specifique = ?, description = ? WHERE id = ?", 
+                        (val, desc, rec_id)
+                    )
+                    con.commit()
+                self.load_objectif_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر التعديل: {e}")
+
+    def delete_objectif(self):
+        row = self.tbl_objectif.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد هدف مميز للحذف.")
+            return
+        item = self.tbl_objectif.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+        if QMessageBox.question(self, "تأكيد", "هل أنت متأكد من الحذف؟") == QMessageBox.Yes:
+            try:
+                with self.db.connect() as con:
+                    con.execute("DELETE FROM objectif_specifique WHERE id = ?", (rec_id,))
+                    con.commit()
+                self.load_objectif_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الحذف: {e}")
+
+    def copy_objectif(self):
+        row = self.tbl_objectif.currentRow()
+        if row >= 0:
+            item = self.tbl_objectif.item(row, 0)
+            self.copied_obj_text = item.text()
+            self.copied_obj_desc = item.data(Qt.UserRole + 1) or ""
+            QApplication.clipboard().setText(self.copied_obj_text)
+
+    def paste_objectif(self):
+        if hasattr(self, 'copied_obj_text') and self.selected_moukawan_id:
+            try:
+                with self.db.connect() as con:
+                    con.execute("INSERT INTO objectif_specifique (objectif_specifique, id_moukawa_kifaya, description) VALUES (?, ?, ?)", (self.copied_obj_text, self.selected_moukawan_id, self.copied_obj_desc))
+                    con.commit()
+                self.load_objectif_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر اللصق: {e}")
+
+    def add_content(self):
+        if not self.selected_objectif_id:
+            QMessageBox.warning(self, "تنبيه", "يرجى اختيار هدف مميز أولاً.")
+            return
+            
+        fields = [
+            ("المحتوى:", ""),
+            ("الملاحظات (اختياري):", "")
+        ]
+        vals, ok = self.multi_input_dialog("إضافة محتوى جديد", fields)
+        
+        if ok and vals[0]:
+            val = vals[0]
+            desc = vals[1]
+            try:
+                with self.db.connect() as con:
+                    con.execute(
+                        "INSERT INTO content (content, id_objectif_specifique, description) VALUES (?, ?, ?)", 
+                        (val, self.selected_objectif_id, desc)
+                    )
+                    con.commit()
+                self.load_content_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الإضافة: {e}")
+
+    def edit_content(self):
+        row = self.tbl_content.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد محتوى للتعديل.")
+            return
+        item_cnt = self.tbl_content.item(row, 0)
+        rec_id = item_cnt.data(Qt.UserRole)
+        current_text = item_cnt.text()
+        current_desc = item_cnt.data(Qt.UserRole + 1) or ""
+        
+        fields = [
+            ("تعديل المحتوى:", current_text),
+            ("تعديل الملاحظات:", current_desc)
+        ]
+        vals, ok = self.multi_input_dialog("تعديل المحتوى", fields)
+        
+        if ok and vals[0]:
+            val = vals[0]
+            desc = vals[1]
+            try:
+                with self.db.connect() as con:
+                    con.execute(
+                        "UPDATE content SET content = ?, description = ? WHERE id = ?", 
+                        (val, desc, rec_id)
+                    )
+                    con.commit()
+                self.load_content_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر التعديل: {e}")
+
+    def delete_content(self):
+        row = self.tbl_content.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "تنبيه", "يرجى تحديد محتوى للحذف.")
+            return
+        item = self.tbl_content.item(row, 0)
+        rec_id = item.data(Qt.UserRole)
+        if QMessageBox.question(self, "تأكيد", "هل أنت متأكد من الحذف؟") == QMessageBox.Yes:
+            try:
+                with self.db.connect() as con:
+                    con.execute("DELETE FROM content WHERE id = ?", (rec_id,))
+                    con.commit()
+                self.load_content_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر الحذف: {e}")
+
+    def copy_content(self):
+        row = self.tbl_content.currentRow()
+        if row >= 0:
+            item = self.tbl_content.item(row, 0)
+            self.copied_cnt_text = item.text()
+            self.copied_cnt_desc = item.data(Qt.UserRole + 1) or ""
+            QApplication.clipboard().setText(self.copied_cnt_text)
+
+    def paste_content(self):
+        if hasattr(self, 'copied_cnt_text') and self.selected_objectif_id:
+            try:
+                with self.db.connect() as con:
+                    con.execute("INSERT INTO content (content, id_objectif_specifique, description) VALUES (?, ?, ?)", (self.copied_cnt_text, self.selected_objectif_id, self.copied_cnt_desc))
+                    con.commit()
+                self.load_content_data()
+            except Exception as e:
+                QMessageBox.critical(self, "خطأ", f"تعذر اللصق: {e}")
+
+    def input_dialog(self, title, label_text, default_text=""):
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.setMinimumWidth(450)
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        
+        txt = QTextEdit() if len(default_text) > 30 or "\n" in default_text or "المجال" in title or "المادة" in title else QLineEdit()
+        if isinstance(txt, QTextEdit):
+            txt.setPlainText(default_text)
+            txt.setMinimumHeight(100)
+        else:
+            txt.setText(default_text)
+            
+        form.addRow(label_text, txt)
+        layout.addLayout(form)
+        
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+        
+        if dlg.exec() == QDialog.Accepted:
+            val = txt.toPlainText().strip() if isinstance(txt, QTextEdit) else txt.text().strip()
+            return val, True
+        return "", False
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -1114,7 +2143,7 @@ class SchoolPlanner(QMainWindow):
                 self.date_edit.setDate(qd)
         
         self.load_day()
-        self.load_statistics() # استدعاء الإحصائيات عند بدء التشغيل
+        self.load_statistics()
         self.setStyleSheet("QLineEdit { qproperty-alignment: AlignCenter; }")
         self.showMaximized()
         self.setAcceptDrops(True)
@@ -1124,9 +2153,10 @@ class SchoolPlanner(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ==========================================
-        # 1. إعداد مكونات دفتر إعداد الدروس (الصفحة الافتتاحية)
-        # ==========================================
+        from PySide6.QtGui import QKeySequence, QShortcut
+        self.competence_shortcut = QShortcut(QKeySequence("Ctrl+Shift+E"), self)
+        self.competence_shortcut.activated.connect(self.open_competence_manager)
+
         self.school_box = QGroupBox("بيانات المعلم")
         school_grid = QGridLayout(self.school_box)
         self.year_edit = QLineEdit("2026-2027")
@@ -1176,12 +2206,12 @@ class SchoolPlanner(QMainWindow):
         
         for label, callback, act_type in [
             ("＋ إضافة حصة", self.add_lesson, "add"), 
-            ("✎ تعديل الحصة", self.edit_lesson,"edit"),
-            ("－ حذف الحصة", self.delete_lesson,"delete"),
+            ("✎ تعديل الحصة", self.edit_lesson, "edit"),
+            ("－ حذف الحصة", self.delete_lesson, "delete"),
             ("📋 نسخ الحصة", self.copy_selected_lessons, "copy_paste"),
             ("📌 لصق الحصة", self.paste_lessons, "copy_paste"),
-            ("🗑 مسح حصص اليوم", self.clear_current_day_lessons,"clear"),
-            ("⚠️ مسح الكل (كل الأيام)", self.clear_all_lessons_in_db,"clear")
+            ("🗑 مسح حصص اليوم", self.clear_current_day_lessons, "clear"),
+            ("⚠️ مسح الكل (كل الأيام)", self.clear_all_lessons_in_db, "clear")
         ]:
             b = QPushButton(label)
             b.clicked.connect(callback)
@@ -1210,7 +2240,7 @@ class SchoolPlanner(QMainWindow):
         act_buttons = QHBoxLayout()
         
         for label, callback, act_type in [
-            ("＋ إضافة نشاط", self.add_activity,"add"), 
+            ("＋ إضافة نشاط", self.add_activity, "add"), 
             ("✎ تعديل النشاط", self.edit_activity, "edit"),
             ("－ حذف النشاط", self.delete_activity, "delete"),
             ("🗑 مسح كل الأنشطة", self.clear_all_activities_for_lesson, "clear")
@@ -1262,9 +2292,6 @@ class SchoolPlanner(QMainWindow):
         lower.setSizes([600, 600])
         splitter.setSizes([370, 500])
 
-        # ==========================================
-        # 2. إعداد صفحة الإحصائيات (menu احصائيات)
-        # ==========================================
         self.stats_page = QWidget()
         stats_layout = QVBoxLayout(self.stats_page)
         
@@ -1310,9 +2337,8 @@ class SchoolPlanner(QMainWindow):
         stats_splitter.setSizes([450, 550])
         stats_layout.addWidget(stats_splitter, 1)
 
-        # ==========================================
-        # 3. تجميع الصفحات داخل QStackedWidget (دفتر الدروس أولاً)
-        # ==========================================
+        self.official_programs_page = OfficialProgramsWidget(self.db, self)
+
         self.pages_stack = QStackedWidget()
         
         self.lesson_page = QWidget()
@@ -1320,9 +2346,10 @@ class SchoolPlanner(QMainWindow):
         lesson_page_layout.addWidget(self.school_box)
         lesson_page_layout.addWidget(agenda)
         lesson_page_layout.addWidget(splitter, 1)
+        
         self.pages_stack.addWidget(self.lesson_page)
-
         self.pages_stack.addWidget(self.stats_page)
+        self.pages_stack.addWidget(self.official_programs_page)
 
         self.plans_page = QWidget()
         plans_layout = QVBoxLayout(self.plans_page)
@@ -1343,13 +2370,7 @@ class SchoolPlanner(QMainWindow):
         self.statusBar().showMessage(f"قاعدة البيانات: {DB_PATH}")
         toolbar = self.addToolBar("ملف")
 
-        # ==========================================
-        # 4. إعداد أزرار وقوائم شريط الأدوات (Toolbar)
-        # ==========================================
-        
-        # قائمة دفتر إعداد الدروس (بدون قائمة فرعية، الحدث مضاف مباشرة للقائمة الأم)
         lesson_book_menu = QMenu("دفتر إعداد الدروس", self)
-        
         open_lesson_action = QAction("فتح دفتر إعداد الدروس", self)
         open_lesson_action.triggered.connect(lambda: self.pages_stack.setCurrentWidget(self.lesson_page))
         lesson_book_menu.addAction(open_lesson_action)
@@ -1389,7 +2410,28 @@ class SchoolPlanner(QMainWindow):
         lesson_book_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(lesson_book_button)
 
-        # قائمة إحصائيات
+        prog_menu = QMenu("البرامج الرسمية", self)
+        open_prog_action = QAction("فتح إدارة البرامج الرسمية", self)
+        open_prog_action.triggered.connect(lambda: self.pages_stack.setCurrentWidget(self.official_programs_page))
+        prog_menu.addAction(open_prog_action)
+        prog_menu.addSeparator()
+
+        self.export_prog_action = QAction("تصدير مكونات الكفاية (JSON)", self)
+        self.export_prog_action.triggered.connect(self.export_programs_json)
+        prog_menu.addAction(self.export_prog_action)
+
+        self.import_prog_action = QAction("استيراد مكونات الكفاية (JSON)", self)
+        self.import_prog_action.triggered.connect(self.import_programs_json)
+        prog_menu.addAction(self.import_prog_action)
+
+        prog_menu.aboutToShow.connect(self.update_prog_actions_state)
+        
+        prog_button = QToolButton(self)
+        prog_button.setText("البرامج الرسمية")
+        prog_button.setMenu(prog_menu)
+        prog_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        toolbar.addWidget(prog_button)
+
         stats_menu = QMenu("إحصائيات", self)
         stats_action = QAction("فتح لوحة الإحصائيات", self)
         stats_action.triggered.connect(lambda: {
@@ -1403,7 +2445,6 @@ class SchoolPlanner(QMainWindow):
         stats_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(stats_button)
 
-        # قائمة المخططات
         plans_menu = QMenu("المخططات", self)
         plans_action = QAction("فتح المخططات", self)
         plans_action.triggered.connect(lambda: self.pages_stack.setCurrentWidget(self.plans_page))
@@ -1414,7 +2455,6 @@ class SchoolPlanner(QMainWindow):
         plans_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(plans_button)
 
-        # قائمة دفتر التقييم والمتابعة
         assessment_menu = QMenu("دفتر التقييم والمتابعة", self)
         assessment_action = QAction("فتح دفتر التقييم والمتابعة", self)
         assessment_action.triggered.connect(lambda: self.pages_stack.setCurrentWidget(self.assessment_page))
@@ -1424,10 +2464,16 @@ class SchoolPlanner(QMainWindow):
         assessment_button.setMenu(assessment_menu)
         assessment_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         toolbar.addWidget(assessment_button)
-    
+
+    def open_competence_manager(self):
+        dlg = CompetenceManagerDialog(db=self.db, parent=self)
+        dlg.setLayoutDirection(self.layoutDirection())
+        if self.styleSheet():
+            dlg.setStyleSheet(self.styleSheet())
+        dlg.exec()
+
     def load_statistics(self):
         try:
-            # ربط المخطط البياني بخط التطبيق والخطوط الداعمة للغة العربية
             app_font = load_custom_font()
             plt.rcParams['font.family'] = 'sans-serif'
             plt.rcParams['font.sans-serif'] = [app_font, 'Noto Naskh Arabic', 'Arial', 'DejaVu Sans']
@@ -1444,18 +2490,15 @@ class SchoolPlanner(QMainWindow):
             total_days = df['date'].nunique() if 'date' in df.columns else 0
             total_classes = df['classe'].nunique() if 'classe' in df.columns else 0
 
-            # تحديث البطاقات الإحصائية
             self.stat_card_days.setText(f"📅 الأيام المسجلة: {total_days}")
             self.stat_card_lessons.setText(f"📘 إجمالي الحصص: {total_lessons}")
             self.stat_card_classes.setText(f"🏫 الأقسام المسجلة: {total_classes}")
 
-            # استخدام Pandas لتجميع البيانات حسب المجال (majal)
             if 'majal' in df.columns:
                 stats_df = df['majal'].value_counts().reset_index()
                 stats_df.columns = ['majal', 'count']
                 stats_df['percentage'] = (stats_df['count'] / total_lessons) * 100
 
-                # تعبئة الجدول بالبيانات المجمعة
                 self.stats_table.setRowCount(0)
                 for _, row in stats_df.iterrows():
                     r = self.stats_table.rowCount()
@@ -1464,11 +2507,8 @@ class SchoolPlanner(QMainWindow):
                     self.stats_table.setItem(r, 1, QTableWidgetItem(str(row['count'])))
                     self.stats_table.setItem(r, 2, QTableWidgetItem(f"{row['percentage']:.1f}%"))
 
-                # رسم المخطط البياني العمودي (Vertical Bar Chart) بألوان جذابة متناسقة مع الـ Style
                 if hasattr(self, 'ax') and hasattr(self, 'canvas'):
                     self.ax.clear()
-                    
-                    # لوحة ألوان عصرية ومتناسقة (تتطابق مع الثيمات الحديثة)
                     palette_colors = ['#3498db', '#2ecc71', '#e74c3c', '#f39c12', '#9b59b6', '#1abc9c', '#34495e']
                     colors = [palette_colors[i % len(palette_colors)] for i in range(len(stats_df))]
                     
@@ -1482,17 +2522,12 @@ class SchoolPlanner(QMainWindow):
                         alpha=0.9
                     )
                     
-                    # تخصيص عناوين المحاور والتصميم الجمالي للـ Graph
                     self.ax.set_title("توزيع الحصص حسب المجالات التعليمية", fontsize=13, fontweight='bold', pad=15, color='#2c3e50')
                     self.ax.set_xlabel("المجال التعليمي", fontsize=10, fontweight='bold', labelpad=10)
                     self.ax.set_ylabel("عدد الحصص", fontsize=10, fontweight='bold', labelpad=10)
-                    
-                    # تدوير أسماء المجالات قليلاً لتجنب التداخل وضمان الوضوح
                     plt.setp(self.ax.get_xticklabels(), rotation=20, ha='right', fontsize=9, fontweight='bold')
-                    
                     self.ax.grid(axis='y', linestyle='--', alpha=0.5)
                     
-                    # إظهار القيمة الرقمية فوق كل عمود
                     for bar in bars:
                         height = bar.get_height()
                         self.ax.text(
@@ -1510,31 +2545,6 @@ class SchoolPlanner(QMainWindow):
                     self.canvas.draw()
         except Exception as e:
             print(f"Error loading statistics: {e}")
-
-    def apply_graph_style(self, fig, ax):
-        """تطبيق تصميم واجهة التطبيق (Style.qss) على المخطط البياني"""
-        # لون خلفية لوحة الرسم ليتطابق مع الخلفية العامة للنافذة
-        fig.patch.set_facecolor('#ffffff')
-        ax.set_facecolor('#f8f9fa')
-        
-        # إزالة الإطارات العلوية واليمنى لإعطاء مظهر عصري (Flat Design)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        
-        # تنسيق إطارات المحاور السفلية واليسرى لتتطابق مع حدود الحقول والبطاقات
-        ax.spines['left'].set_color('#ced4da')
-        ax.spines['bottom'].set_color('#ced4da')
-        ax.spines['left'].set_linewidth(1.0)
-        ax.spines['bottom'].set_linewidth(1.0)
-        
-        # خطوط الشبكة الخلفية بلون هادئ وغير مزعج
-        ax.grid(axis='y', linestyle='--', alpha=0.6, color='#e9ecef')
-        ax.set_axisbelow(True)
-        
-        # تنسيق النصوص والأرقام على المحاور بلون متناسق مع النصوص العادية
-        ax.tick_params(colors='#495057', labelsize=9, width=1)
-        for label in ax.get_xticklabels() + ax.get_yticklabels():
-            label.set_fontweight('bold')
 
     def toggle_enseig_info(self):
         row = self.db.school_info()
@@ -1787,8 +2797,7 @@ class SchoolPlanner(QMainWindow):
                 "activities": []
             }
             
-            acts = self.db.activities(lesson_id)
-            for act in acts:
+            for act in self.db.activities(lesson_id):
                 act_id, act_title, act_time = act[0], act[1], act[2]
                 details = self.db.details(act_id)
                 act_data = {
@@ -1799,7 +2808,6 @@ class SchoolPlanner(QMainWindow):
                 lesson_data["activities"].append(act_data)
                 
             self.copied_lessons.append(lesson_data)
-            
         self.statusBar().showMessage(f"تم نسخ {len(self.copied_lessons)} حصة بنجاح.", 3000)
 
     def paste_lessons(self):
@@ -1913,7 +2921,7 @@ class SchoolPlanner(QMainWindow):
                 reply = QMessageBox.question(
                     self,
                     "تنبيه: خاصية موجودة مسبقاً",
-                    f"اسم الخاصية '{key}' موجود مسبقاً لهذا النشاط.\nهل تريد متابعة الإضافَة رغم ذلك؟",
+                    f"اسم الخاصية '{key}' موجود مسبقاً لهذا النشاط.\nهل تريد متابعة الإضافة رغم ذلك؟",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No
                 )
@@ -1955,22 +2963,17 @@ class SchoolPlanner(QMainWindow):
         msg_box.setWindowTitle("تأكيد العملية")
         msg_box.setText(message)
         msg_box.setIcon(QMessageBox.Question)
-        
         btn_yes = msg_box.addButton("نعم", QMessageBox.AcceptRole)
         btn_no = msg_box.addButton("إلغاء", QMessageBox.RejectRole)
-        
         msg_box.exec()
         return msg_box.clickedButton() == btn_yes
 
     def export_odt_from_db_dialog(self):
-        # 1. إظهار حوار اختيار اليوم مع التقويم المخصص
         dlg = DaySelectionDialog(self.db, parent=self)
         if not dlg.exec():
-            return  # إذا ألغى المستخدم العملية
+            return
         
         selected_date_text = dlg.get_selected_date_str()
-        
-        # 2. تنفيذ عملية التصدير بنفس منطقك السابق ولكن باستخدام التاريخ المختار
         formatter = SchoolDataFormatter(str(DB_PATH))
         formatted_db_date = formatter.normalize_date(selected_date_text)
         
@@ -2059,15 +3062,11 @@ class SchoolPlanner(QMainWindow):
 
     def export_day_to_json(self):
         import json
-        
-        # 1. إظهار حوار اختيار اليوم باستخدام التقويم المخصص
         dlg = DaySelectionDialog(self.db, parent=self)
         if not dlg.exec():
-            return  # إذا ألغى المستخدم العملية
+            return
         
         selected_date_text = dlg.get_selected_date_str()
-        
-        # 2. جلب وتصدير بيانات اليوم المحدد
         formatter = SchoolDataFormatter(str(DB_PATH))
         formatted_db_date = formatter.normalize_date(selected_date_text)
         
@@ -2126,7 +3125,6 @@ class SchoolPlanner(QMainWindow):
             QMessageBox.information(self, "نجاح التصدير", f"تم تصدير بيانات يوم {day_row['date']} بنجاح إلى مجلد المستندات:\n{filename}")
             return True
 
-    
     def import_day_from_json(self):
         import json
         from PySide6.QtWidgets import QFileDialog
@@ -2178,8 +3176,28 @@ class SchoolPlanner(QMainWindow):
         urls = event.mimeData().urls()
         if urls:
             file_path = urls[0].toLocalFile()
-            if file_path:
-                self.process_json_import(file_path)
+            if file_path and file_path.endswith('.json'):
+                try:
+                    import json
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    
+                    # التحقق من نوع البيانات بناءً على المفاتيح الموجودة في الملف
+                    if "moukawan_kifaya" in data or ("majal" in data and "matiere" in data and "days" not in data):
+                        # هذا ملف مكونات كفاية خاص بالبرامج الرسمية
+                        if self.pages_stack.currentWidget() != self.official_programs_page:
+                            self.pages_stack.setCurrentWidget(self.official_programs_page)
+                        self.import_programs_json(file_path)
+                    elif "days" in data or "school_info" in data and "date" not in data:
+                        # هذا ملف سنة دراسية كاملة
+                        self.process_json_import(file_path)
+                    elif "date" in data and "lessons" in data:
+                        # هذا ملف يوم دراسي واحد
+                        self.process_json_import(file_path)
+                    else:
+                        QMessageBox.warning(self, "خطأ في نوع الملف", "لم يتم التعرف على هيكل البيانات داخل ملف JSON المسحوب.")
+                except Exception as e:
+                    QMessageBox.critical(self, "خطأ", f"تعذر قراءة الملف:\n{e}")
 
     def import_all_years_from_json(self):
         from PySide6.QtWidgets import QFileDialog
@@ -2274,7 +3292,6 @@ class SchoolPlanner(QMainWindow):
                 self.load_school_info()
                 self.load_day()
                 QMessageBox.information(self, "نجاح الاستيراد الشامل", f"تم استيراد السنة الدراسية بكافة أيامها ({imported_days_count} يوم) بنجاح!")
-
             else:
                 target_date = data.get("date")
                 if not target_date:
@@ -2302,7 +3319,6 @@ class SchoolPlanner(QMainWindow):
                     self.date_edit.setDate(qd)
                 self.load_day()
                 QMessageBox.information(self, "نجاح الاستيراد", f"تم استيراد بيانات يوم {target_date} بنجاح وتسجيلها في التطبيق.")
-
         except Exception as e:
             QMessageBox.critical(self, "خطأ في الاستيراد", f"حدث خطأ أثناء قراءة أو استيراد ملف JSON:\n{e}")
 
@@ -2483,6 +3499,196 @@ class SchoolPlanner(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "خطأ في التصدير", f"حدث خطأ أثناء تصدير بيانات السنة الدراسية:\n{e}")
             return False
+        
+
+    def update_prog_actions_state(self):
+        """التحقق من تفعيل خيارات التصدير والاستيراد بناءً على الصفحة الحالية والفلترة"""
+        is_page_active = (self.pages_stack.currentWidget() == self.official_programs_page)
+        has_selection = (
+            is_page_active and
+            getattr(self.official_programs_page, 'selected_level_id', None) is not None and
+            getattr(self.official_programs_page, 'selected_majal_id', None) is not None and
+            getattr(self.official_programs_page, 'selected_competence_matiere_id', None) is not None
+        )
+        self.export_prog_action.setEnabled(has_selection)
+        self.import_prog_action.setEnabled(has_selection)
+
+    def export_programs_json(self):
+        import json
+        from PySide6.QtWidgets import QFileDialog
+        
+        matiere_id = self.official_programs_page.selected_competence_matiere_id
+        if not matiere_id:
+            return
+
+        try:
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                
+                # جلب بيانات المادة وكفاية المجال والمجال والمستوى
+                cursor.execute("""
+                    SELECT cm.matiere, cm.competence, cmajal.competence, m.name, l.name 
+                    FROM competence_matiere cm
+                    JOIN competence_majal cmajal ON cm.id_competence_majal = cmajal.id
+                    JOIN majal m ON cmajal.id_majal = m.id
+                    JOIN level l ON cmajal.id_level = l.id
+                    WHERE cm.id = ?
+                """, (matiere_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return
+                
+                data = {
+                    "level": row[4],
+                    "majal": row[3],
+                    "competence_majal": row[2],
+                    "matiere": row[0],
+                    "competence_matiere": row[1],
+                    "moukawan_kifaya": []
+                }
+                
+                # جلب مكونات الكفاية والشجرة التابعة لها
+                cursor.execute("SELECT id, competence FROM moukawan_kifaya WHERE id_competence_matiere = ?", (matiere_id,))
+                moukawans = cursor.fetchall()
+                for mouk in moukawans:
+                    mouk_id, mouk_comp = mouk[0], mouk[1]
+                    mouk_dict = {
+                        "competence": mouk_comp,
+                        "objectif_specifique": []
+                    }
+                    
+                    cursor.execute("SELECT id, objectif_specifique, description FROM objectif_specifique WHERE id_moukawa_kifaya = ?", (mouk_id,))
+                    objs = cursor.fetchall()
+                    for obj in objs:
+                        obj_id, obj_text, obj_desc = obj[0], obj[1], obj[2]
+                        obj_dict = {
+                            "objectif_specifique": obj_text,
+                            "description": obj_desc or "",
+                            "content": []
+                        }
+                        
+                        cursor.execute("SELECT content, description FROM content WHERE id_objectif_specifique = ?", (obj_id,))
+                        cnts = cursor.fetchall()
+                        for cnt in cnts:
+                            obj_dict["content"].append({
+                                "content": cnt[0],
+                                "description": cnt[1] or ""
+                            })
+                        
+                        mouk_dict["objectif_specifique"].append(obj_dict)
+                    data["moukawan_kifaya"].append(mouk_dict)
+
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "تصدير شجرة مكونات الكفاية", 
+                str(Path.home() / "Documents" / f"competence_tree_{row[0]}.json"), 
+                "JSON Files (*.json);;All Files (*)"
+            )
+            if file_path:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                QMessageBox.information(self, "نجاح التصدير", f"تم تصدير الشجرة الكاملة لمكونات الكفاية بنجاح إلى:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ في التصدير", f"حدث خطأ أثناء تصدير البيانات:\n{e}")
+
+
+    def import_programs_json(self, file_path=None):
+        import json
+        from PySide6.QtWidgets import QFileDialog
+        
+        matiere_id = self.official_programs_page.selected_competence_matiere_id
+        if not matiere_id:
+            return
+
+        if not file_path:
+            file_path, _ = QFileDialog.getOpenFileName(
+                self, "اختيار ملف JSON لاستيراد مكونات الكفاية", 
+                str(Path.home() / "Documents"), 
+                "JSON Files (*.json);;All Files (*)"
+            )
+            if not file_path:
+                return
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            file_majal = data.get("majal", "").strip()
+            file_matiere = data.get("matiere", "").strip()
+            
+            with self.db.connect() as con:
+                cursor = con.cursor()
+                cursor.execute("""
+                    SELECT m.name, cm.matiere 
+                    FROM competence_matiere cm
+                    JOIN competence_majal cmajal ON cm.id_competence_majal = cmajal.id
+                    JOIN majal m ON cmajal.id_majal = m.id
+                    WHERE cm.id = ?
+                """, (matiere_id,))
+                current_info = cursor.fetchone()
+                
+                if current_info:
+                    current_majal, current_matiere = current_info[0].strip(), current_info[1].strip()
+                    
+                    if (file_majal and file_majal != current_majal) or (file_matiere and file_matiere != current_matiere):
+                        QMessageBox.warning(
+                            self, 
+                            "خطأ في مطابقة البيانات", 
+                            f"لا يمكن الاستيراد! الملف يتبع:\n(المجال: {file_majal} — النشاط/المادة: {file_matiere})\n\nبينما التحديد الحالي في البرنامج يتبع:\n(المجال: {current_majal} — النشاط/المادة: {current_matiere})."
+                        )
+                        return
+
+                # مسح البيانات السابقة أولاً
+                cursor.execute("DELETE FROM moukawan_kifaya WHERE id_competence_matiere = ?", (matiere_id,))
+                
+                # إدراج البيانات الجديدة من الملف
+                for mouk in data.get("moukawan_kifaya", []):
+                    if isinstance(mouk, str):
+                        mouk_text = mouk
+                        objs_list = []
+                    else:
+                        mouk_text = mouk.get("competence", "")
+                        objs_list = mouk.get("objectif_specifique", [])
+
+                    cursor.execute(
+                        "INSERT INTO moukawan_kifaya (competence, id_competence_matiere) VALUES (?, ?)",
+                        (mouk_text, matiere_id)
+                    )
+                    new_mouk_id = cursor.lastrowid
+                    
+                    for obj in objs_list:
+                        if isinstance(obj, str):
+                            obj_text = obj
+                            obj_desc = ""
+                            cnts_list = []
+                        else:
+                            obj_text = obj.get("objectif_specifique", "")
+                            obj_desc = obj.get("description", "")
+                            cnts_list = obj.get("content", [])
+
+                        cursor.execute(
+                            "INSERT INTO objectif_specifique (objectif_specifique, id_moukawa_kifaya, description) VALUES (?, ?, ?)",
+                            (obj_text, new_mouk_id, obj_desc)
+                        )
+                        new_obj_id = cursor.lastrowid
+                        
+                        for cnt in cnts_list:
+                            if isinstance(cnt, str):
+                                cnt_text = cnt
+                                cnt_desc = ""
+                            else:
+                                cnt_text = cnt.get("content", "")
+                                cnt_desc = cnt.get("description", "")
+
+                            cursor.execute(
+                                "INSERT INTO content (content, id_objectif_specifique, description) VALUES (?, ?, ?)",
+                                (cnt_text, new_obj_id, cnt_desc)
+                            )
+                con.commit()
+            
+            self.official_programs_page.load_moukawan_data()
+            QMessageBox.information(self, "نجاح الاستيراد", "تم مسح البيانات السابقة بنجاح، واستيراد الشجرة الجديدة بواسطة السحب والإفلات.")
+        except Exception as e:
+            QMessageBox.critical(self, "خطأ في الاستيراد", f"حدث خطأ أثناء قراءة أو استيراد ملف JSON:\n{e}")
 
 
 def load_custom_font():
